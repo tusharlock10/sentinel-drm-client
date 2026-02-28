@@ -1,6 +1,6 @@
 # Phase 4 — Encrypted State File
 
-**Status**: Pending
+**Status**: Complete
 **Depends on**: Phase 3 (keystore)
 
 ---
@@ -226,11 +226,11 @@ license file. The client must:
 
 ## Done Criteria
 
-- [ ] State file is created in the correct platform-specific directory
-- [ ] `Save` then `Load` roundtrip produces identical state
-- [ ] `Load` returns `nil` (not error) for non-existent file (first run)
-- [ ] Encrypted file is not readable as plaintext
-- [ ] Tampered file causes `Load` to return an error (GCM authentication fails)
-- [ ] Atomic write: killing process during `Save` doesn't corrupt existing state
-- [ ] Encryption key is stored in and retrieved from OS keystore
-- [ ] Directory is created with `0700` permissions if it doesn't exist
+- [x] State file is created in the correct platform-specific directory
+- [x] `Save` then `Load` roundtrip produces identical state
+- [x] `Load` returns `nil` (not error) for non-existent file (first run)
+- [x] Encrypted file is not readable as plaintext
+- [x] Tampered file causes `Load` to return an error (GCM authentication fails)
+- [x] Atomic write: killing process during `Save` doesn't corrupt existing state
+- [x] Encryption key is stored in and retrieved from OS keystore
+- [x] Directory is created with `0700` permissions if it doesn't exist
