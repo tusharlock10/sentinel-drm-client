@@ -60,9 +60,8 @@ func makeStandardPayload() map[string]any {
 		"expiry_date":                 today.AddDate(1, 0, 0).Format("2006-01-02"),
 		"max_machines":                10,
 		"features":                    map[string]any{"max_users": 500},
-		"server_url":                  "https://drm.example.com",
-		"heartbeat_interval_minutes":  15,
-		"heartbeat_grace_period_days": 3,
+		"server_url":                 "https://drm.example.com",
+		"heartbeat_interval_minutes": 15,
 	}
 }
 
@@ -215,7 +214,7 @@ func TestLoadAndVerifyStandardMissingServerURL(t *testing.T) {
 	}
 }
 
-func TestLoadAndVerifyStandardMissingHeartbeatFields(t *testing.T) {
+func TestLoadAndVerifyStandardMissingHeartbeatInterval(t *testing.T) {
 	priv, _ := crypto.GenerateECKeyPair()
 
 	payload := makeStandardPayload()
@@ -226,17 +225,6 @@ func TestLoadAndVerifyStandardMissingHeartbeatFields(t *testing.T) {
 	_, err := LoadAndVerify(path, &priv.PublicKey)
 	if err == nil {
 		t.Fatal("expected error for missing heartbeat_interval_minutes, got nil")
-	}
-	os.Remove(path)
-
-	payload2 := makeStandardPayload()
-	delete(payload2, "heartbeat_grace_period_days")
-	path2 := writeLicFile(t, payload2, priv)
-	defer os.Remove(path2)
-
-	_, err2 := LoadAndVerify(path2, &priv.PublicKey)
-	if err2 == nil {
-		t.Fatal("expected error for missing heartbeat_grace_period_days, got nil")
 	}
 }
 

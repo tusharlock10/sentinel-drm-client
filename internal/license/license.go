@@ -40,7 +40,6 @@ type LicensePayload struct {
 	// STANDARD only
 	ServerURL                *string `json:"server_url,omitempty"`
 	HeartbeatIntervalMinutes *int    `json:"heartbeat_interval_minutes,omitempty"`
-	HeartbeatGracePeriodDays *int    `json:"heartbeat_grace_period_days,omitempty"`
 
 	// HARDWARE_BOUND only
 	HardwareFingerprint *string `json:"hardware_fingerprint,omitempty"`
@@ -138,9 +137,6 @@ func validatePayload(p *LicensePayload) error {
 		if p.HeartbeatIntervalMinutes == nil || *p.HeartbeatIntervalMinutes <= 0 {
 			return fmt.Errorf("STANDARD license missing heartbeat_interval_minutes")
 		}
-		if p.HeartbeatGracePeriodDays == nil || *p.HeartbeatGracePeriodDays <= 0 {
-			return fmt.Errorf("STANDARD license missing heartbeat_grace_period_days")
-		}
 		if p.HardwareFingerprint != nil && *p.HardwareFingerprint != "" {
 			return fmt.Errorf("invalid license payload: hardware_fingerprint must not be set for STANDARD licenses")
 		}
@@ -151,9 +147,6 @@ func validatePayload(p *LicensePayload) error {
 		}
 		if p.HeartbeatIntervalMinutes != nil {
 			return fmt.Errorf("invalid license payload: heartbeat_interval_minutes must not be set for HARDWARE_BOUND licenses")
-		}
-		if p.HeartbeatGracePeriodDays != nil {
-			return fmt.Errorf("invalid license payload: heartbeat_grace_period_days must not be set for HARDWARE_BOUND licenses")
 		}
 	}
 
