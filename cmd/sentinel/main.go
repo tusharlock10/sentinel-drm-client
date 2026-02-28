@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tusharlock10/sentinel-drm-client/internal/config"
 	"github.com/tusharlock10/sentinel-drm-client/internal/crypto"
+	"github.com/tusharlock10/sentinel-drm-client/internal/sentinel"
 )
 
 // orgPublicKeyPEM is the EC P-256 public key of the organization, embedded at build time.
@@ -58,13 +59,15 @@ func run(cmd *cobra.Command, args []string) error {
 	cfg := &config.Config{
 		LicensePath:  licensePath,
 		SoftwarePath: softwarePath,
+		Version:      version,
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	// Phase 7: orchestrator will be wired here.
-	_ = orgPubKey
-	fmt.Println("Starting sentinel...")
-	return nil
+	ctx, cancel := sentinel.SetupSignalHandler()
+	defer cancel()
+
+	s := sentinel.New(cfg, orgPubKey)
+	return s.Run(ctx)
 }

@@ -2,7 +2,7 @@
 
 **Status**: In Progress
 **Last Updated**: 2026-02-28
-**Phases Complete**: 1, 2, 3, 4, 5, 6
+**Phases Complete**: 1, 2, 3, 4, 5, 6, 7
 
 ---
 
@@ -165,12 +165,14 @@ not passed as a CLI flag.
 type Config struct {
     LicensePath  string
     SoftwarePath string
+    Version      string // set from -ldflags "-X main.version=..." at build time; empty in dev builds
 }
 
 func (c *Config) Validate() error
 ```
 
-Validation: license and software paths must exist on disk.
+Validation: license and software paths must exist on disk. `Version` is not validated
+(empty is valid for development builds).
 
 ### Crypto (internal/crypto/crypto.go)
 
@@ -402,6 +404,7 @@ type StateManager struct { ... }
 func NewStateManager(ks keystore.Keystore) (*StateManager, error)
 func (sm *StateManager) Load() (*State, error)   // nil if first run
 func (sm *StateManager) Save(state *State) error
+func (sm *StateManager) Delete() error           // removes state file; used on decommission
 ```
 
 ---
@@ -685,7 +688,7 @@ reading JSON lines and writing JSON line responses.
 
 ---
 
-## 9. Phase 7 — Main Orchestrator
+## 9. Phase 7 — Main Orchestrator ✓
 
 ### Files
 
@@ -704,95 +707,92 @@ type Sentinel struct {
     ipcServer *ipc.Server
 }
 
-func New(cfg *config.Config, orgPubKey *ecdsa.PublicKey) (*Sentinel, error)
+func New(cfg *config.Config, orgPubKey *ecdsa.PublicKey) *Sentinel
 func (s *Sentinel) Run(ctx context.Context) error
+
+// SetupSignalHandler is a package-level function (not a method). Called from main.go
+// before constructing the Sentinel, so the context is available for Run().
+func SetupSignalHandler() (context.Context, context.CancelFunc)
 ```
 
 ### STANDARD License Flow
 
 1. Load and verify license file (signature + expiry)
-2. Initialize keystore
-3. Load or generate machine EC keypair from keystore
+2. Initialize keystore (vault key = `keystore.DeriveVaultKey(hardware.GetMachineID())`)
+3. Load or generate machine EC keypair from keystore; PEM bytes wrapped in
+   `memguard.LockedBuffer` when loaded from keystore
 4. Load state file. If first run, generate machine ID (UUID v4), create initial state
-5. **Activation**: If `state.Activated == false`, call `drm.Activate()`. On success,
+5. **License key change detection**: if `state.LicenseKey != license.LicenseKey`, reset
+   activation, grace quota, and `GraceExhausted`
+6. Create DRM client using `*license.ServerURL` (server URL is embedded in license file,
+   not a CLI flag)
+7. **Activation**: If `state.Activated == false`, call `drm.Activate()`. On success,
    set `state.Activated = true`, save state
-6. **Mandatory startup heartbeat**: Call `drm.Heartbeat()`.
-   - If server unreachable:
+8. **Mandatory startup heartbeat**: Call `drm.Heartbeat()`.
+   - If server unreachable (connection error):
      - If `grace_remaining_seconds > 0` and `!grace_exhausted`: allow startup,
-       begin consuming grace
-     - If `grace_exhausted == true`: refuse to start, exit with error
-     - If `grace_remaining_seconds <= 0`: refuse to start, exit with error
+       log warning — grace will be consumed by heartbeat loop
+     - If `grace_exhausted == true` or `grace_remaining_seconds <= 0`: refuse to start
    - If server responds with non-ACTIVE status:
-     - `DECOMMISSION_PENDING`: call `drm.DecommissionAck()`, clean up, exit gracefully
+     - `DECOMMISSION_PENDING`: call `drm.DecommissionAck()`, delete state, exit
      - `REVOKED`, `EXPIRED`, `SUSPENDED`: exit with appropriate error message
-7. Launch software process
-8. Start IPC server in a goroutine
-9. Start heartbeat loop in a goroutine
-10. Start anti-tamper monitoring (Phase 8)
-11. Wait for: software exit OR fatal heartbeat failure OR signal
+9. Launch software process; pass `SENTINEL_IPC_SOCKET` env var
+10. Start IPC server in a goroutine
+11. Start heartbeat loop in a goroutine
+12. Start anti-tamper monitoring (Phase 8)
+13. Wait for: software exit OR fatal heartbeat failure OR signal
 
 ### HARDWARE_BOUND License Flow
 
 1. Load and verify license file (signature + expiry)
 2. Collect hardware fingerprint
 3. Compare with `license.HardwareFingerprint` — must match exactly
-4. Launch software process
+4. Launch software process; use fingerprint as machine ID for IPC socket naming
 5. Start IPC server
 6. Start anti-tamper monitoring (Phase 8)
 7. Wait for software exit or signal
-8. No heartbeat loop, no server communication, fully offline
+8. No heartbeat loop, no server communication, no state file — fully offline
 
 ### Heartbeat Loop
 
 ```go
-func (s *Sentinel) heartbeatLoop(ctx context.Context) {
-    interval := time.Duration(*s.license.HeartbeatIntervalMinutes) * time.Minute
-    ticker := time.NewTicker(interval)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            resp, err := s.doHeartbeat()
-            if err != nil {
-                s.consumeGrace(interval)
-                if s.isGraceExhausted() {
-                    s.shutdown("Grace period exhausted")
-                    return
-                }
-                continue
-            }
-            s.handleHeartbeatResponse(resp)
-        }
-    }
-}
+func (s *Sentinel) heartbeatLoop(ctx context.Context, st *state.State,
+    stateMgr *state.StateManager, drmClient *drm.Client)
 ```
+
+- Runs on a `time.Ticker` at `heartbeat_interval_minutes`
+- **Connection error**: calls `consumeGrace` (package-level). If `isGraceExhausted`
+  (package-level) → calls `s.process.Stop()` and returns
+- **Server error** (non-connection): logs and continues — does NOT consume grace
+- **Successful heartbeat**: updates `LastHeartbeatSuccess`, saves state, calls
+  `processHeartbeatResponse`
+- **`processHeartbeatResponse` returns error** → calls `s.process.Stop()` and returns
 
 ### Grace Period Logic
 
 - **Total grace quota**: `heartbeat_grace_period_days * 24 * 60 * 60` seconds
   (e.g., 3 days = 259,200 seconds)
-- **Each missed heartbeat** consumes `heartbeat_interval_minutes * 60` seconds
-  from the quota
-- **On successful heartbeat**: grace stops being consumed, remaining quota is
+- **Each missed heartbeat (connection error only)** consumes `heartbeat_interval_minutes * 60` seconds
+- **Server errors** (HTTP 4xx/5xx): do NOT consume grace — retry next interval
+- **On successful heartbeat**: grace stops being consumed; remaining quota is
   preserved (NOT reset to full)
-- **After full exhaustion** (`grace_exhausted = true`): software comes back online
-  and works, but next single heartbeat miss = immediate stop (no more grace)
-- **Server is source of truth**: client trusts server response
-- **Startup always contacts server** (STANDARD licenses): prevents grace abuse
-  via restart cycling. If state file is deleted/tampered, startup forces
-  re-sync with server
+- **After full exhaustion** (`grace_exhausted = true`): software works if server
+  is reachable, but next single connection miss = immediate shutdown (no grace left)
+- **Startup always contacts server** (STANDARD licenses): prevents restart cycling
+  to abuse grace period
 
 ### Signal Handling
 
+`SetupSignalHandler()` is a package-level function called from `main.go`. It returns
+a cancellable context that is passed into `Run()`.
+
 On SIGINT/SIGTERM:
-1. Cancel context (stops heartbeat loop)
-2. Close IPC server
-3. Stop software process gracefully (SIGTERM → wait 10s → SIGKILL)
-4. Save final state
-5. Exit
+1. Context is cancelled → heartbeat loop returns, IPC Serve returns
+2. Main select picks up `ctx.Done()` → calls `cleanup()` (saves state, closes IPC)
+3. Calls `proc.Stop()` (SIGTERM → 10s → SIGKILL)
+4. Sentinel exits
+
+`cleanup(st, stateMgr)` does not take a context parameter (it is unused).
 
 ---
 
@@ -990,9 +990,11 @@ Phase 6 ✓ Process management and IPC
           ├── internal/ipc/ipc_unix_test.go       dialSocket helper (Linux/macOS)
           └── internal/ipc/ipc_windows_test.go    dialSocket helper (Windows)
 
-Phase 7   Main orchestrator
-          └── internal/sentinel/sentinel.go  STANDARD + HARDWARE_BOUND flows,
-                                             heartbeat loop, grace period, signals
+Phase 7 ✓ Main orchestrator
+          ├── internal/sentinel/sentinel.go  STANDARD + HARDWARE_BOUND flows,
+          │                                  heartbeat loop, grace period, signal handling
+          ├── internal/config/config.go      added Version field (threaded from main ldflags var)
+          └── cmd/sentinel/main.go           wired: SetupSignalHandler(), sentinel.New(), Run()
 
 Phase 8   Anti-tamper, degradation, and build system
           ├── internal/antitamper/          debugger detection, degradation stages

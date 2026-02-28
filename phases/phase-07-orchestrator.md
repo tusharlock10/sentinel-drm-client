@@ -1,6 +1,6 @@
 # Phase 7 — Main Orchestrator
 
-**Status**: Pending
+**Status**: Done
 **Depends on**: Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6
 
 ---
@@ -19,7 +19,8 @@
 | File | Action |
 |---|---|
 | `internal/sentinel/sentinel.go` | Created — main orchestrator |
-| `cmd/sentinel/main.go` | Modified — call `sentinel.New()` and `sentinel.Run()` |
+| `internal/config/config.go` | Modified — added `Version string` field |
+| `cmd/sentinel/main.go` | Modified — call `sentinel.SetupSignalHandler()`, `sentinel.New()`, `s.Run()` |
 
 ---
 
@@ -36,8 +37,12 @@ type Sentinel struct {
     ipcServer *ipc.Server
 }
 
-func New(cfg *config.Config, orgPubKey *ecdsa.PublicKey) *Sentinel
+func New(cfg *config.Config, orgPubKey *ecdsa.PublicKey) *Sentinel  // no error return
 func (s *Sentinel) Run(ctx context.Context) error
+
+// SetupSignalHandler is a package-level function, not a method on *Sentinel.
+// Called from main.go before New(), so the context is available for Run().
+func SetupSignalHandler() (context.Context, context.CancelFunc)
 ```
 
 ---
@@ -71,12 +76,7 @@ func (s *Sentinel) Run(ctx context.Context) error {
 
 ## STANDARD License Flow — `runStandard(ctx)`
 
-### Step 1: Validate Server URL
-
-`config.ServerURL` is required for STANDARD licenses. If empty, exit with error:
-`"--server-url is required for STANDARD licenses"`.
-
-### Step 2: Initialize Keystore
+### Step 1: Initialize Keystore
 
 The vault key is derived from the machine's stable identifier. This ties the
 keystore file to this machine — copying it to another machine yields undecryptable
@@ -153,8 +153,12 @@ if st.LicenseKey != s.license.LicenseKey {
 
 ### Step 6: Create DRM Client
 
+The server URL is embedded in the license payload (`ServerURL *string`), not passed as a
+CLI flag. `license.LoadAndVerify` already validates that `ServerURL` is non-empty for
+STANDARD licenses, so the dereference is safe.
+
 ```go
-drmClient := drm.NewClient(s.config.ServerURL, st.MachineID, machineKey, s.orgPubKey)
+drmClient := drm.NewClient(*s.license.ServerURL, st.MachineID, machineKey, s.orgPubKey)
 ```
 
 ### Step 7: Activation (if needed)
@@ -166,7 +170,7 @@ if !st.Activated {
         MachineID:           st.MachineID,
         MachinePublicKeyPEM: machinePublicPEM,
         Platform:            drm.DetectPlatform(),
-        SoftwareVersion:     version, // embedded build var
+        SoftwareVersion:     s.config.Version,
     })
     if err != nil {
         return fmt.Errorf("activation failed: %w", err)
@@ -189,7 +193,7 @@ period abuse (restart cycling to avoid heartbeat checks).
 resp, err := drmClient.Heartbeat(drm.HeartbeatRequest{
     LicenseKey:      s.license.LicenseKey,
     MachineID:       st.MachineID,
-    SoftwareVersion: version,
+    SoftwareVersion: s.config.Version,
 })
 
 if err != nil {
@@ -290,7 +294,7 @@ func (s *Sentinel) heartbeatLoop(ctx context.Context, st *state.State, stateMgr 
             resp, err := drmClient.Heartbeat(drm.HeartbeatRequest{
                 LicenseKey:      s.license.LicenseKey,
                 MachineID:       st.MachineID,
-                SoftwareVersion: version,
+                SoftwareVersion: s.config.Version,
             })
 
             if err != nil {
@@ -329,8 +333,10 @@ func (s *Sentinel) heartbeatLoop(ctx context.Context, st *state.State, stateMgr 
 
 ### `consumeGrace`
 
+Package-level function (not a method on `*Sentinel`).
+
 ```go
-func (s *Sentinel) consumeGrace(st *state.State, stateMgr *state.StateManager, interval time.Duration) {
+func consumeGrace(st *state.State, stateMgr *state.StateManager, interval time.Duration) {
     consumed := int64(interval.Seconds())
     st.GraceRemainingSeconds -= consumed
     if st.GraceRemainingSeconds < 0 {
@@ -345,8 +351,10 @@ func (s *Sentinel) consumeGrace(st *state.State, stateMgr *state.StateManager, i
 
 ### `isGraceExhausted`
 
+Package-level function (not a method on `*Sentinel`).
+
 ```go
-func (s *Sentinel) isGraceExhausted(st *state.State) bool {
+func isGraceExhausted(st *state.State) bool {
     if st.GraceExhausted {
         return true
     }
@@ -461,10 +469,12 @@ No heartbeat loop. No grace period. Fully offline.
 
 ## Signal Handling
 
-Setup in `Run()` before branching to license-type-specific flows.
+`SetupSignalHandler` is a **package-level function**, not a method on `*Sentinel`. It is
+called from `main.go` before constructing the orchestrator, so the context can be passed
+into `Run()`.
 
 ```go
-func (s *Sentinel) setupSignalHandler() (context.Context, context.CancelFunc) {
+func SetupSignalHandler() (context.Context, context.CancelFunc) {
     ctx, cancel := context.WithCancel(context.Background())
 
     sigCh := make(chan os.Signal, 1)
@@ -482,8 +492,10 @@ func (s *Sentinel) setupSignalHandler() (context.Context, context.CancelFunc) {
 
 ### Cleanup Sequence
 
+`cleanup` does not take a context — it is not needed.
+
 ```go
-func (s *Sentinel) cleanup(ctx context.Context, st *state.State, stateMgr *state.StateManager) {
+func (s *Sentinel) cleanup(st *state.State, stateMgr *state.StateManager) {
     if s.ipcServer != nil {
         s.ipcServer.Close()
     }
@@ -497,35 +509,39 @@ func (s *Sentinel) cleanup(ctx context.Context, st *state.State, stateMgr *state
 
 ## Integration with `cmd/sentinel/main.go`
 
-The main function is updated to call the orchestrator:
+`Version` from ldflags is set on `Config`. Signal handling is set up before the
+orchestrator is constructed.
 
 ```go
-RunE: func(cmd *cobra.Command, args []string) error {
-    // ... (validate embedded key, parse flags, validate config) ...
+cfg := &config.Config{
+    LicensePath:  licensePath,
+    SoftwarePath: softwarePath,
+    Version:      version,  // ldflags var from package main
+}
 
-    s := sentinel.New(cfg, orgPubKey)
-    ctx, cancel := s.setupSignalHandler()
-    defer cancel()
-    return s.Run(ctx)
-},
+ctx, cancel := sentinel.SetupSignalHandler()
+defer cancel()
+
+s := sentinel.New(cfg, orgPubKey)
+return s.Run(ctx)
 ```
 
 ---
 
 ## Done Criteria
 
-- [ ] STANDARD flow: activation → heartbeat → software launch works end-to-end
-- [ ] STANDARD flow: startup heartbeat is mandatory (fails without server)
-- [ ] STANDARD flow: grace period allows startup when server is unreachable (if quota > 0)
-- [ ] STANDARD flow: grace exhaustion causes shutdown
-- [ ] STANDARD flow: `GraceExhausted = true` → next miss = immediate stop
-- [ ] STANDARD flow: successful heartbeat preserves (not resets) grace remaining
-- [ ] STANDARD flow: license key change triggers re-activation
-- [ ] STANDARD flow: decommission response triggers ack and shutdown
-- [ ] STANDARD flow: REVOKED/EXPIRED/SUSPENDED responses cause shutdown with message
-- [ ] HARDWARE_BOUND flow: matching fingerprint → software launches
-- [ ] HARDWARE_BOUND flow: mismatching fingerprint → exit with error
-- [ ] HARDWARE_BOUND flow: no server communication attempted
-- [ ] Signal handling: SIGINT/SIGTERM → graceful shutdown of IPC, process, state save
-- [ ] Software process exit → Sentinel shuts down
-- [ ] IPC socket path includes machine ID for uniqueness
+- [x] STANDARD flow: activation → heartbeat → software launch works end-to-end
+- [x] STANDARD flow: startup heartbeat is mandatory (fails without server)
+- [x] STANDARD flow: grace period allows startup when server is unreachable (if quota > 0)
+- [x] STANDARD flow: grace exhaustion causes shutdown
+- [x] STANDARD flow: `GraceExhausted = true` → next miss = immediate stop
+- [x] STANDARD flow: successful heartbeat preserves (not resets) grace remaining
+- [x] STANDARD flow: license key change triggers re-activation
+- [x] STANDARD flow: decommission response triggers ack and shutdown
+- [x] STANDARD flow: REVOKED/EXPIRED/SUSPENDED responses cause shutdown with message
+- [x] HARDWARE_BOUND flow: matching fingerprint → software launches
+- [x] HARDWARE_BOUND flow: mismatching fingerprint → exit with error
+- [x] HARDWARE_BOUND flow: no server communication attempted
+- [x] Signal handling: SIGINT/SIGTERM → graceful shutdown of IPC, process, state save
+- [x] Software process exit → Sentinel shuts down
+- [x] IPC socket path includes machine ID for uniqueness

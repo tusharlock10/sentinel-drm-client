@@ -9,6 +9,7 @@ import (
 type Config struct {
 	LicensePath  string
 	SoftwarePath string
+	Version      string // set from ldflags at build time; empty in dev builds
 }
 
 // Validate checks that all required paths exist on disk.
