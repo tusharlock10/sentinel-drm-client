@@ -244,24 +244,23 @@ const (
 )
 
 type LicensePayload struct {
-    V                        int            `json:"v"`
-    LicenseKey               string         `json:"license_key"`
-    OrgID                    string         `json:"org_id"`
-    SoftwareID               string         `json:"software_id"`
-    LicenseType              LicenseType    `json:"license_type"`
-    IssueDate                string         `json:"issue_date"`    // YYYY-MM-DD
-    ExpiryDate               string         `json:"expiry_date"`   // YYYY-MM-DD
-    MaxMachines              int            `json:"max_machines"`
-    Features                 map[string]any `json:"features"`
-    IssuedAt                 string         `json:"issued_at"`     // ISO 8601
+    V           int            `json:"v"`
+    LicenseKey  string         `json:"license_key"`
+    OrgID       string         `json:"org_id"`
+    SoftwareID  string         `json:"software_id"`
+    LicenseType LicenseType    `json:"license_type"`
+    IssueDate   string         `json:"issue_date"`  // "YYYY-MM-DD" — license becomes active on this date
+    ExpiryDate  string         `json:"expiry_date"` // "YYYY-MM-DD" — last valid day (inclusive)
+    MaxMachines int            `json:"max_machines"`
+    Features    map[string]any `json:"features"`
 
     // STANDARD only
-    ServerURL                *string        `json:"server_url,omitempty"`                  // DRM backend base URL
-    HeartbeatIntervalMinutes *int           `json:"heartbeat_interval_minutes,omitempty"`
-    HeartbeatGracePeriodDays *int           `json:"heartbeat_grace_period_days,omitempty"`
+    ServerURL                *string `json:"server_url,omitempty"`                 // DRM backend base URL
+    HeartbeatIntervalMinutes *int    `json:"heartbeat_interval_minutes,omitempty"`
+    HeartbeatGracePeriodDays *int    `json:"heartbeat_grace_period_days,omitempty"`
 
     // HARDWARE_BOUND only
-    HardwareFingerprint      *string        `json:"hardware_fingerprint,omitempty"`
+    HardwareFingerprint *string `json:"hardware_fingerprint,omitempty"`
 }
 ```
 
@@ -277,12 +276,14 @@ type LicensePayload struct {
    — signature is over the raw base64url string bytes
 6. Base64url-decode the `payload` field
 7. JSON unmarshal into `LicensePayload`
-8. Validate required fields
-9. Validate `license_type` is known
-10. Check `expiry_date` is not in the past
-11. For `STANDARD`: validate `server_url` is present and non-empty; validate heartbeat fields are present and positive
-12. For `HARDWARE_BOUND`: validate `hardware_fingerprint` is present and non-empty
-13. Return the parsed payload
+8. Validate payload: call `validatePayload()` which checks:
+   - `v` == 1, required string fields non-empty, `license_type` is known, `max_machines` >= 1
+   - `issue_date` and `expiry_date` parse as `"YYYY-MM-DD"`
+   - today (UTC) >= `issue_date` — dormancy gate; fail: `"license is not yet active (activates: ...)"`
+   - today (UTC) <= `expiry_date` — expiry gate; `expiry_date` is the last valid day inclusive
+   - STANDARD: `server_url` non-empty, heartbeat fields non-nil and positive, no `hardware_fingerprint`
+   - HARDWARE_BOUND: `hardware_fingerprint` non-empty, no heartbeat fields
+9. Return the parsed payload
 
 ---
 
@@ -937,8 +938,9 @@ Phase 1 ✓ Project skeleton, CLI, crypto primitives
           ├── internal/crypto/crypto.go   base64url, ECDSA, canonical JSON, SHA-256
           └── internal/crypto/crypto_test.go  unit tests (14 tests, all passing)
 
-Phase 2   License file parsing and verification
-          └── internal/license/license.go  parse .lic, verify sig, extract payload
+Phase 2 ✓ License file parsing and verification
+          ├── internal/license/license.go      parse .lic, verify sig, extract payload
+          └── internal/license/license_test.go 16 tests, all passing
 
 Phase 3   Hardware fingerprint and OS keystore
           ├── internal/hardware/           platform-specific fingerprint collection
