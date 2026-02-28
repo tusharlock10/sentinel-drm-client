@@ -83,8 +83,9 @@ type LicensePayload struct {
     IssuedAt    string         `json:"issued_at"`     // ISO 8601
 
     // STANDARD only (omitted from JSON for HARDWARE_BOUND)
-    HeartbeatIntervalMinutes *int `json:"heartbeat_interval_minutes,omitempty"`
-    HeartbeatGracePeriodDays *int `json:"heartbeat_grace_period_days,omitempty"`
+    ServerURL                *string `json:"server_url,omitempty"`                 // DRM backend base URL
+    HeartbeatIntervalMinutes *int    `json:"heartbeat_interval_minutes,omitempty"`
+    HeartbeatGracePeriodDays *int    `json:"heartbeat_grace_period_days,omitempty"`
 
     // HARDWARE_BOUND only (omitted from JSON for STANDARD)
     HardwareFingerprint *string `json:"hardware_fingerprint,omitempty"`
@@ -190,6 +191,7 @@ All errors should be descriptive and include context:
 "invalid license payload: malformed JSON"
 "license version 2 is not supported (expected 1)"
 "license has expired (expiry: 2025-01-01)"
+"STANDARD license missing server_url"
 "STANDARD license missing heartbeat_interval_minutes"
 "HARDWARE_BOUND license missing hardware_fingerprint"
 ```
@@ -203,6 +205,7 @@ All errors should be descriptive and include context:
 - [ ] Signature verification fails with a tampered payload
 - [ ] Expired licenses are rejected with a clear error message
 - [ ] Unknown `license_type` values are rejected
+- [ ] STANDARD licenses missing `server_url` are rejected
 - [ ] STANDARD licenses missing heartbeat fields are rejected
 - [ ] HARDWARE_BOUND licenses missing fingerprint are rejected
 - [ ] `IsExpired` returns correct results for past, today, and future dates

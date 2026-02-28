@@ -1,6 +1,6 @@
 # Phase 1 — Project Skeleton, CLI, and Crypto Primitives
 
-**Status**: Pending
+**Status**: Completed
 **Depends on**: None
 
 ---
@@ -17,12 +17,11 @@
 
 ```bash
 go get github.com/spf13/cobra
-go get github.com/awnuber/memguard
 ```
 
-`memguard` is used to protect private key material in memory (prevents swap-to-disk,
-core-dump exposure). It will be used in later phases but is added now to keep
-dependency additions in one place.
+`github.com/awnumar/memguard` (secure memory for private key material) is added in
+Phase 3 when it is first used. Adding it here without any call sites would cause
+`go mod tidy` to remove it.
 
 ---
 
@@ -30,10 +29,11 @@ dependency additions in one place.
 
 | File | Action |
 |---|---|
-| `go.mod` | Modified — update Go version to 1.26; add cobra, memguard |
+| `go.mod` | Modified — Go version updated to 1.26; cobra added |
 | `cmd/sentinel/main.go` | Rewritten — cobra root command, embedded key var, flag parsing |
 | `internal/config/config.go` | Created — Config struct, validation |
 | `internal/crypto/crypto.go` | Created — all crypto utilities |
+| `internal/crypto/crypto_test.go` | Created — unit tests covering all Done Criteria |
 
 ---
 
@@ -58,14 +58,15 @@ At startup:
 Single root command (no subcommands). Usage:
 
 ```
-sentinel --license /path/to/license.lic --software /path/to/binary --server-url https://drm.example.com
+sentinel --license /path/to/license.lic --software /path/to/binary
 ```
 
 Flags:
 - `--license` (string, required) — path to the `.lic` file
 - `--software` (string, required) — path to the software binary to launch
-- `--server-url` (string, optional) — base URL of the Sentinel DRM backend.
-  Required for STANDARD licenses, ignored for HARDWARE_BOUND.
+
+The server URL for STANDARD license heartbeats is embedded inside the license file
+itself, not passed as a CLI flag.
 
 The root command's `RunE` function:
 1. Validates the embedded public key
@@ -82,7 +83,6 @@ The root command's `RunE` function:
 type Config struct {
     LicensePath  string
     SoftwarePath string
-    ServerURL    string
 }
 
 func (c *Config) Validate() error
@@ -91,8 +91,6 @@ func (c *Config) Validate() error
 **Validation rules:**
 - `LicensePath` must be non-empty and the file must exist on disk
 - `SoftwarePath` must be non-empty and the file must exist on disk
-- `ServerURL` is validated later (after license type is known); at this stage just
-  check it's a valid URL if non-empty (use `net/url.Parse`)
 
 `Validate()` returns a descriptive error for the first failing check. No fallbacks
 or defaults — fail fast.
@@ -268,36 +266,39 @@ issues to handle:
    and re-serialize with sorted keys.
 
 2. **`ensure_ascii=True`**: Python escapes all non-ASCII characters to `\uXXXX`.
-   Go's `json.Marshal` also escapes non-ASCII by default when encoding strings,
-   so this should match. Verify with test cases.
+   Go's `json.Marshal` does NOT do this — it emits valid UTF-8 bytes as-is.
+   The output of `writeCanonical` must be post-processed with `escapeNonASCII`,
+   which iterates the bytes, decodes UTF-8 runes, and replaces any rune ≥ 0x80
+   with its `\uXXXX` form (or a UTF-16 surrogate pair for runes outside the BMP).
 
 **Implementation approach:**
 
 ```go
 func CanonicalJSON(v any) ([]byte, error) {
-    // First marshal to get a map representation
     raw, err := json.Marshal(v)
     if err != nil {
         return nil, err
     }
-    // Decode into ordered structure
     var obj any
     if err := json.Unmarshal(raw, &obj); err != nil {
         return nil, err
     }
-    // Re-serialize with sorted keys
     var buf bytes.Buffer
     if err := writeCanonical(&buf, obj); err != nil {
         return nil, err
     }
-    return buf.Bytes(), nil
+    return escapeNonASCII(buf.Bytes()), nil
 }
 ```
 
 The `writeCanonical` helper recursively writes JSON with sorted keys at every level.
 For maps: collect keys, sort them, write `{` + key-value pairs + `}`.
 For slices: write `[` + elements + `]`.
-For primitives: use `json.Marshal` (which already escapes non-ASCII).
+For primitives: use `json.Marshal`.
+
+The `escapeNonASCII` helper scans the final output and replaces every rune ≥ 0x80
+with its `\uXXXX` escape (or a UTF-16 surrogate pair for runes > U+FFFF). This is
+skipped entirely if the output contains no non-ASCII bytes.
 
 #### `SHA256Hex(data []byte) string`
 
@@ -331,14 +332,14 @@ func SHA256File(path string) (string, error) {
 
 ## Done Criteria
 
-- [ ] `go.mod` updated with Go 1.26+ and cobra/memguard dependencies
-- [ ] `cmd/sentinel/main.go` uses cobra root command with `--license`, `--software`, `--server-url` flags
-- [ ] Embedded `orgPublicKeyPEM` variable validated at startup (empty = exit with error)
-- [ ] `internal/config/config.go` validates file existence and URL format
-- [ ] `Base64URLEncode` / `Base64URLDecode` roundtrip works correctly
-- [ ] `CanonicalJSON` output matches Python's `json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=True)` for known test payloads
-- [ ] EC key generation, PEM serialization roundtrip works (generate → PEM → parse → compare)
-- [ ] `SignECDSA` / `VerifyECDSA` roundtrip works
-- [ ] `SHA256Hex` produces correct output for known inputs
-- [ ] `SHA256File` computes correct hash for a test file
-- [ ] No external crypto dependencies — all functions use Go stdlib `crypto/*`
+- [x] `go.mod` updated with Go 1.26 and cobra dependency
+- [x] `cmd/sentinel/main.go` uses cobra root command with `--license` and `--software` flags (server URL is embedded in the license file, not a CLI flag)
+- [x] Embedded `orgPublicKeyPEM` variable validated at startup (empty = exit with error)
+- [x] `internal/config/config.go` validates that license and software files exist on disk
+- [x] `Base64URLEncode` / `Base64URLDecode` roundtrip works correctly
+- [x] `CanonicalJSON` output matches Python's `json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=True)` for known test payloads
+- [x] EC key generation, PEM serialization roundtrip works (generate → PEM → parse → compare)
+- [x] `SignECDSA` / `VerifyECDSA` roundtrip works
+- [x] `SHA256Hex` produces correct output for known inputs
+- [x] `SHA256File` computes correct hash for a test file
+- [x] No external crypto dependencies — all functions use Go stdlib `crypto/*`

@@ -49,8 +49,9 @@ embedded at compile time via `-ldflags`. The client:
 
 The customer downloads all three, places them on a machine, and runs:
 ```
-sentinel --license /path/to/license.lic --software /path/to/binary --server-url https://drm.example.com
+sentinel --license /path/to/license.lic --software /path/to/binary
 ```
+The server URL (for STANDARD licenses) is embedded in the license file itself.
 
 ---
 
@@ -128,13 +129,14 @@ Phase 8: antitamper, Makefile          (depends on: ipc, sentinel)
 
 ---
 
-## 3. Phase 1 — Project Skeleton, CLI, Crypto Primitives
+## 3. Phase 1 — Project Skeleton, CLI, Crypto Primitives ✓
 
 ### Files
 
 - `cmd/sentinel/main.go`
 - `internal/config/config.go`
 - `internal/crypto/crypto.go`
+- `internal/crypto/crypto_test.go`
 
 ### CLI (cmd/sentinel/main.go)
 
@@ -148,12 +150,13 @@ var version string         // set via -ldflags "-X main.version=..."
 Required flags:
 - `--license` (string) — path to the `.lic` file
 - `--software` (string) — path to the software binary
-- `--server-url` (string) — base URL of the Sentinel DRM server (required for STANDARD,
-  ignored for HARDWARE_BOUND)
 
 At startup, validate that `orgPublicKeyPEM` is non-empty and parseable into an
 `*ecdsa.PublicKey`. Exit with a clear error if not (indicates the binary was built
 without embedding the org key).
+
+The server URL for STANDARD license heartbeats is embedded inside the license file,
+not passed as a CLI flag.
 
 ### Config (internal/config/config.go)
 
@@ -161,14 +164,12 @@ without embedding the org key).
 type Config struct {
     LicensePath  string
     SoftwarePath string
-    ServerURL    string
 }
 
 func (c *Config) Validate() error
 ```
 
-Validation: license and software paths must exist on disk. ServerURL must be a valid
-URL if provided.
+Validation: license and software paths must exist on disk.
 
 ### Crypto (internal/crypto/crypto.go)
 
@@ -201,8 +202,10 @@ ensure_ascii=True)`. The Go implementation MUST produce byte-identical output:
 
 Go's `encoding/json` already produces compact JSON, but key ordering of `map[string]any`
 is not guaranteed. Use a recursive key-sorting approach: marshal to intermediate
-representation, sort keys, then serialize. The `ensure_ascii=True` behavior must be
-replicated by post-processing the output to escape any non-ASCII runes.
+representation, sort keys, then serialize. The `ensure_ascii=True` behavior is NOT
+automatic in Go — Go's `json.Marshal` emits valid UTF-8 as-is. The output is
+post-processed with `escapeNonASCII`, which replaces every rune ≥ 0x80 with its
+`\uXXXX` form (UTF-16 surrogate pairs for runes > U+FFFF).
 
 ---
 
@@ -253,6 +256,7 @@ type LicensePayload struct {
     IssuedAt                 string         `json:"issued_at"`     // ISO 8601
 
     // STANDARD only
+    ServerURL                *string        `json:"server_url,omitempty"`                  // DRM backend base URL
     HeartbeatIntervalMinutes *int           `json:"heartbeat_interval_minutes,omitempty"`
     HeartbeatGracePeriodDays *int           `json:"heartbeat_grace_period_days,omitempty"`
 
@@ -276,7 +280,7 @@ type LicensePayload struct {
 8. Validate required fields
 9. Validate `license_type` is known
 10. Check `expiry_date` is not in the past
-11. For `STANDARD`: validate heartbeat fields are present and positive
+11. For `STANDARD`: validate `server_url` is present and non-empty; validate heartbeat fields are present and positive
 12. For `HARDWARE_BOUND`: validate `hardware_fingerprint` is present and non-empty
 13. Return the parsed payload
 
@@ -893,7 +897,7 @@ External Go dependencies:
 | Dependency | Purpose | Justification |
 |---|---|---|
 | `github.com/spf13/cobra` | CLI framework | Mentioned in CLAUDE.md. Single root command with flags |
-| `github.com/awnuber/memguard` | Secure memory for private keys | Mentioned in CLAUDE.md. Prevents key material from being swapped to disk |
+| `github.com/awnumar/memguard` | Secure memory for private keys | Mentioned in CLAUDE.md. Prevents key material from being swapped to disk. Added in Phase 3 when first used. |
 | `github.com/zalando/go-keyring` | Cross-platform OS keystore | Strong payoff vs implementing 3 platform-specific keystores from scratch |
 | `mvdan.cc/garble` | Binary obfuscation | Mentioned in CLAUDE.md. Build tool only, not a library dependency |
 
@@ -927,10 +931,11 @@ at the software level. This will be revisited when working on a hardware-based s
 Each phase is independently committable and testable.
 
 ```
-Phase 1   Project skeleton, CLI, crypto primitives
+Phase 1 ✓ Project skeleton, CLI, crypto primitives
           ├── cmd/sentinel/main.go        cobra root command, embedded key var
           ├── internal/config/config.go   Config struct, flag parsing, validation
-          └── internal/crypto/crypto.go   base64url, ECDSA, canonical JSON, SHA-256
+          ├── internal/crypto/crypto.go   base64url, ECDSA, canonical JSON, SHA-256
+          └── internal/crypto/crypto_test.go  unit tests (14 tests, all passing)
 
 Phase 2   License file parsing and verification
           └── internal/license/license.go  parse .lic, verify sig, extract payload
