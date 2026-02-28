@@ -1,6 +1,6 @@
 # Phase 8 — Anti-Tamper, Degradation, and Build System
 
-**Status**: Pending
+**Status**: Complete
 **Depends on**: Phase 6 (IPC), Phase 7 (orchestrator)
 
 ---
@@ -19,10 +19,12 @@
 | File | Action |
 |---|---|
 | `internal/antitamper/antitamper.go` | Created — monitor orchestrator, degradation state machine |
-| `internal/antitamper/antitamper_linux.go` | Created — ptrace/TracerPid detection |
+| `internal/antitamper/antitamper_linux.go` | Created — TracerPid detection |
 | `internal/antitamper/antitamper_darwin.go` | Created — sysctl P_TRACED detection |
 | `internal/antitamper/antitamper_windows.go` | Created — IsDebuggerPresent detection |
-| `internal/sentinel/sentinel.go` | Modified — start anti-tamper monitor |
+| `internal/antitamper/antitamper_other.go` | Created — no-op fallback for unsupported platforms |
+| `internal/sentinel/sentinel.go` | Modified — start anti-tamper monitor in both license flows |
+| `cmd/sentinel/main.go` | Modified — unescape PEM newlines embedded by Makefile |
 | `Makefile` | Created — dev build, garble prod build, cross-compilation |
 
 ---
@@ -70,25 +72,9 @@ func isDebuggerAttached() bool {
 }
 ```
 
-#### Ptrace Self-Check
-
-Attempt to ptrace self. If it fails with `EPERM`, another process is already
-tracing us.
-
-```go
-func isPtraceBlocked() bool {
-    // Try PTRACE_TRACEME — fails if already being traced
-    err := syscall.PtraceAttach(os.Getpid())
-    if err != nil {
-        return true // already being traced
-    }
-    syscall.PtraceDetach(os.Getpid())
-    return false
-}
-```
-
-**Note**: `PTRACE_TRACEME` is a better approach. The implementation should use
-the appropriate ptrace call for the Go runtime context. This may need `runtime.LockOSThread()`.
+**Note**: Only the TracerPid check is implemented. The ptrace self-check
+(`PTRACE_TRACEME`) was considered but rejected — it is unsafe in Go's multithreaded
+runtime and can interfere with the Go scheduler.
 
 ---
 
@@ -96,38 +82,38 @@ the appropriate ptrace call for the Go runtime context. This may need `runtime.L
 
 #### sysctl P_TRACED Check
 
-Use the `sysctl` system call to check for the `P_TRACED` flag on our own process.
+Use `unix.SysctlKinfoProc` to query the kernel for our process info and check the
+`P_TRACED` flag.
 
 ```go
 //go:build darwin
 
-import "golang.org/x/sys/unix"
+import (
+    "os"
+    "golang.org/x/sys/unix"
+)
+
+// pTraced is the P_TRACED flag from <sys/proc.h>. Set by the kernel when a
+// debugger is attached. Not exported by golang.org/x/sys/unix.
+const pTraced = 0x00000800
 
 func isDebuggerAttached() bool {
-    var info unix.KinfoProc
-    mib := [4]int32{unix.CTL_KERN, unix.KERN_PROC, unix.KERN_PROC_PID, int32(os.Getpid())}
-
-    n := uintptr(unsafe.Sizeof(info))
-    _, _, errno := unix.Syscall6(
-        unix.SYS___SYSCTL,
-        uintptr(unsafe.Pointer(&mib[0])),
-        4,
-        uintptr(unsafe.Pointer(&info)),
-        uintptr(unsafe.Pointer(&n)),
-        0, 0,
-    )
-    if errno != 0 {
-        return false
+    info, err := unix.SysctlKinfoProc("kern.proc.pid", os.Getpid())
+    if err != nil {
+        return false // cannot determine, assume safe
     }
-
-    return info.Kproc.P_flag&unix.P_TRACED != 0
+    return info.Proc.P_flag&pTraced != 0
 }
 ```
 
-**Note**: This requires `golang.org/x/sys/unix`. The exact struct layout and
-constant names may vary — verify against the Go sys package documentation.
-If `x/sys` is too heavy, an alternative is to shell out to
-`sysctl kern.proc.pid.<pid>` and parse the output.
+**Important**: The following constants are **not exported** by `golang.org/x/sys/unix`
+for darwin and must be used as raw values:
+- `KERN_PROC` = 14, `KERN_PROC_PID` = 1 (use `unix.SysctlKinfoProc` instead — it handles
+  the MIB translation internally)
+- `P_TRACED` = `0x00000800` — defined locally as `pTraced`
+
+The `KinfoProc` struct field is `info.Proc.P_flag` (`Proc` of type `ExternProc`,
+field `P_flag int32`). The previously documented `info.Kproc` name is incorrect.
 
 ---
 
@@ -138,31 +124,48 @@ If `x/sys` is too heavy, an alternative is to shell out to
 ```go
 //go:build windows
 
-import "golang.org/x/sys/windows"
+import (
+    "unsafe"
+    "golang.org/x/sys/windows"
+)
 
 var (
-    kernel32                     = windows.NewLazyDLL("kernel32.dll")
-    procIsDebuggerPresent        = kernel32.NewProc("IsDebuggerPresent")
+    kernel32                       = windows.NewLazyDLL("kernel32.dll")
+    procIsDebuggerPresent          = kernel32.NewProc("IsDebuggerPresent")
     procCheckRemoteDebuggerPresent = kernel32.NewProc("CheckRemoteDebuggerPresent")
 )
 
 func isDebuggerAttached() bool {
-    // Check for local debugger
+    // Check for a local debugger (e.g. WinDbg, x64dbg attached locally).
     ret, _, _ := procIsDebuggerPresent.Call()
     if ret != 0 {
         return true
     }
 
-    // Check for remote debugger
-    var isRemoteDebugger int32
+    // Check for a remote debugger attached via the debug API.
+    var isRemote int32
     ret, _, _ = procCheckRemoteDebuggerPresent.Call(
         uintptr(windows.CurrentProcess()),
-        uintptr(unsafe.Pointer(&isRemoteDebugger)),
+        uintptr(unsafe.Pointer(&isRemote)),
     )
-    if ret != 0 && isRemoteDebugger != 0 {
+    if ret != 0 && isRemote != 0 {
         return true
     }
 
+    return false
+}
+```
+
+---
+
+### Other platforms — `antitamper_other.go`
+
+A no-op fallback for any platform that is not linux, darwin, or windows.
+
+```go
+//go:build !linux && !darwin && !windows
+
+func isDebuggerAttached() bool {
     return false
 }
 ```
@@ -175,10 +178,10 @@ func isDebuggerAttached() bool {
 
 ```go
 type Monitor struct {
-    ipcServer   *ipc.Server
-    detected    atomic.Bool
-    stage       atomic.Int32
-    detectedAt  time.Time
+    ipcServer  *ipc.Server
+    detected   atomic.Bool
+    stage      atomic.Int32
+    detectedAt time.Time
 }
 
 func NewMonitor(ipcServer *ipc.Server) *Monitor
@@ -188,13 +191,14 @@ func (m *Monitor) IsCompromised() bool
 
 ### `Start(ctx context.Context)`
 
-Runs in a goroutine. Periodically checks for tampering and manages degradation.
+Runs in a goroutine. Checks for tampering immediately at startup, then periodically
+with random jitter.
 
 ```go
 func (m *Monitor) Start(ctx context.Context) {
-    // Initial check at startup
+    // Check immediately at startup before entering the loop.
     if isDebuggerAttached() {
-        m.onDetected()
+        m.onDetected(ctx)
     }
 
     for {
@@ -206,7 +210,7 @@ func (m *Monitor) Start(ctx context.Context) {
             return
         case <-time.After(jitter):
             if isDebuggerAttached() {
-                m.onDetected()
+                m.onDetected(ctx)
             }
             if m.detected.Load() {
                 m.progressDegradation()
@@ -216,42 +220,50 @@ func (m *Monitor) Start(ctx context.Context) {
 }
 ```
 
-### `onDetected()`
+### `onDetected(ctx context.Context)`
 
-Called on first detection. Sets the detection flag and timestamp.
+Called on first detection. Sets the detection flag, records the timestamp, advances
+to `StageWarnings`, and starts the warning emission goroutine.
 
 ```go
-func (m *Monitor) onDetected() {
+func (m *Monitor) onDetected(ctx context.Context) {
     if m.detected.CompareAndSwap(false, true) {
         m.detectedAt = time.Now()
         m.stage.Store(int32(ipc.StageWarnings))
         m.ipcServer.SetDegradeStage(ipc.StageWarnings)
+        go m.warningLoop(ctx)
     }
 }
 ```
 
+**Note**: `onDetected` takes `ctx context.Context` so it can pass it to the warning
+goroutine. The ctx is needed for clean shutdown when the process exits normally.
+
 ### `progressDegradation()`
 
-Advances through degradation stages based on time elapsed since detection.
+Advances through degradation stages based on time elapsed since detection. A ±30s
+jitter is applied on every call so stage transitions are not predictable.
 
 ```go
 func (m *Monitor) progressDegradation() {
-    elapsed := time.Since(m.detectedAt)
-    var newStage ipc.DegradeStage
+    // ±30s jitter so attackers cannot fingerprint the exact transition timing.
+    jitterSecs := rand.Intn(61) - 30
+    adjustedElapsed := time.Since(m.detectedAt) + time.Duration(jitterSecs)*time.Second
+    if adjustedElapsed < 0 {
+        adjustedElapsed = 0
+    }
 
+    var newStage ipc.DegradeStage
     switch {
-    case elapsed < 2*time.Minute:
+    case adjustedElapsed < 2*time.Minute:
         newStage = ipc.StageWarnings
-    case elapsed < 5*time.Minute:
+    case adjustedElapsed < 5*time.Minute:
         newStage = ipc.StageErrors
-    case elapsed < 10*time.Minute:
+    case adjustedElapsed < 10*time.Minute:
         newStage = ipc.StageSlowdown
     default:
         newStage = ipc.StageCrash
     }
-
-    // Add random jitter to stage transitions (±30 seconds)
-    // so timing isn't predictable
 
     currentStage := ipc.DegradeStage(m.stage.Load())
     if newStage > currentStage {
@@ -268,10 +280,24 @@ func (m *Monitor) progressDegradation() {
 
 ### Stage 1: `StageWarnings` (0-2 minutes after detection)
 
-Emit occasional mysterious warning messages to stderr. These should look like
+A dedicated goroutine (`warningLoop`) is started by `onDetected`. It emits cryptic
+warning messages to stderr every 15-30 seconds (randomised). The messages look like
 plausible system warnings, not anti-tamper messages.
 
 ```go
+func (m *Monitor) warningLoop(ctx context.Context) {
+    for {
+        delay := time.Duration(15+rand.Intn(16)) * time.Second
+        select {
+        case <-ctx.Done():
+            return
+        case <-time.After(delay):
+            currentStage := ipc.DegradeStage(m.stage.Load())
+            emitWarning(currentStage)
+        }
+    }
+}
+
 var warningMessages = []string{
     "WARNING: memory integrity check: segment checksum recalculating...",
     "WARN: unexpected TLB flush in secure region",
@@ -279,19 +305,13 @@ var warningMessages = []string{
     "NOTE: entropy pool reseeding (source: hardware)",
     "WARN: secure context migration pending",
 }
-
-func emitWarning() {
-    msg := warningMessages[rand.Intn(len(warningMessages))]
-    fmt.Fprintf(os.Stderr, "%s\n", msg)
-}
 ```
-
-Frequency: every 15-30 seconds (random).
 
 ### Stage 2: `StageErrors` (2-5 minutes after detection)
 
-Inject fake errors into IPC responses (handled by IPC server via `SetDegradeStage`).
-Also emit error-like messages to stderr.
+The `warningLoop` goroutine escalates to error-level messages once `StageErrors` is
+reached (it reads the current stage on every iteration). IPC responses are degraded
+via `SetDegradeStage` (implemented in Phase 6).
 
 ```go
 var errorMessages = []string{
@@ -300,32 +320,43 @@ var errorMessages = []string{
     "FATAL: page fault in protected region 0x7fff...",
     "error: secure channel handshake timeout (attempt 3/5)",
 }
+
+func emitWarning(stage ipc.DegradeStage) {
+    var msgs []string
+    if stage >= ipc.StageErrors {
+        msgs = errorMessages
+    } else {
+        msgs = warningMessages
+    }
+    fmt.Fprintf(os.Stderr, "%s\n", msgs[rand.Intn(len(msgs))])
+}
 ```
 
 IPC behavior at this stage (implemented in Phase 6 `handleRequest`):
-- `get_features` returns partial features (randomly drop keys)
-- `get_license` intermittently returns `{status: "error", error: "internal error"}`
-- About 30% of requests fail with random errors
+- `get_features` returns empty features map
+- `get_license` intermittently returns `{status: "error", error: "license validation failed"}`
+- ~30% of requests fail with a random system error
 
 ### Stage 3: `StageSlowdown` (5-10 minutes after detection)
 
-Artificially increase resource usage to make the process appear unstable.
+`applyStage` calls `applySlowdown()` which starts intentionally-leaking goroutines
+that waste memory and CPU.
 
 ```go
 func applySlowdown() {
-    // Allocate memory in goroutines
+    // Memory waste: allocate 50 MB in 1 MB chunks over ~25-75 seconds.
     go func() {
         var waste [][]byte
         for i := 0; i < 50; i++ {
-            chunk := make([]byte, 1<<20) // 1MB chunks
-            rand.Read(chunk)             // fill to prevent optimization
+            chunk := make([]byte, 1<<20) // 1 MB
+            _, _ = crand.Read(chunk)     // crypto/rand fill to prevent optimization
             waste = append(waste, chunk)
             time.Sleep(time.Duration(500+rand.Intn(1000)) * time.Millisecond)
         }
         runtime.KeepAlive(waste)
     }()
 
-    // CPU busy loops in goroutines
+    // CPU busy loops in 2 goroutines: hash 4 KB buffers in a tight loop.
     for i := 0; i < 2; i++ {
         go func() {
             for {
@@ -337,10 +368,13 @@ func applySlowdown() {
 }
 ```
 
+**Note**: `crypto/rand.Read` is used (not `math/rand.Read`, which was deprecated in
+Go 1.20 and removed in later versions).
+
 ### Stage 4: `StageCrash` (10+ minutes after detection)
 
-Terminate with a plausible-looking system error. Add some randomized delay (0-60s)
-so the exact crash time is unpredictable.
+`applyStage` starts `triggerCrash()` in a goroutine. It adds a random 0-60s delay
+then exits with code 137 (looks like an OOM kill: SIGKILL = 128 + 9).
 
 ```go
 func triggerCrash() {
@@ -352,9 +386,8 @@ func triggerCrash() {
         "PANIC: stack corruption detected in runtime verifier",
         "FATAL: unable to recover from page fault in protected region",
     }
-    msg := crashMessages[rand.Intn(len(crashMessages))]
-    fmt.Fprintf(os.Stderr, "%s\n", msg)
-    os.Exit(137) // looks like OOM kill (SIGKILL = 128 + 9)
+    fmt.Fprintf(os.Stderr, "%s\n", crashMessages[rand.Intn(len(crashMessages))])
+    os.Exit(137)
 }
 ```
 
@@ -362,16 +395,30 @@ func triggerCrash() {
 
 ## Integration with Orchestrator
 
-In `internal/sentinel/sentinel.go`, start the anti-tamper monitor after launching
-the IPC server:
+In `internal/sentinel/sentinel.go`, the anti-tamper monitor is started after the
+IPC server in both `runStandard` and `runHardwareBound`:
 
 ```go
-// After IPC server is started
-monitor := antitamper.NewMonitor(s.ipcServer)
-go monitor.Start(ctx)
+go ipcSrv.Serve(ctx)
+go antitamper.NewMonitor(ipcSrv).Start(ctx)
 ```
 
-This applies to both STANDARD and HARDWARE_BOUND flows.
+---
+
+## PEM Embedding in main.go
+
+The Makefile embeds the org public key PEM with literal `\n` characters (to avoid
+shell quoting issues with multiline strings in `-ldflags`). `main.go` must unescape
+them before parsing:
+
+```go
+// The Makefile embeds the PEM with literal \n to avoid shell quoting issues.
+// Restore real newlines before parsing.
+orgPublicKeyPEM = strings.ReplaceAll(orgPublicKeyPEM, `\n`, "\n")
+```
+
+This is applied in the `run()` function immediately after the empty-check, before
+`crypto.ParseECPublicKeyPEM`.
 
 ---
 
@@ -379,78 +426,37 @@ This applies to both STANDARD and HARDWARE_BOUND flows.
 
 ```makefile
 VERSION ?= dev
-ORG_PUBLIC_KEY_PEM ?=
+# Path to the org's EC P-256 public key PEM file.
+# Usage: make build-prod ORG_PUBLIC_KEY_PEM_FILE=org_pubkey.pem VERSION=1.0.0
+ORG_PUBLIC_KEY_PEM_FILE ?=
 
-# Escape newlines in PEM for ldflags
-LDFLAGS := -X 'main.orgPublicKeyPEM=$(ORG_PUBLIC_KEY_PEM)' \
+# Convert the PEM file's real newlines to literal \n for ldflags single-line embedding.
+# main.go unescapes \n back to real newlines at startup.
+_PEM_ESCAPED := $(if $(ORG_PUBLIC_KEY_PEM_FILE),$(shell awk 'BEGIN{ORS="\\n"} 1' "$(ORG_PUBLIC_KEY_PEM_FILE)"),)
+
+LDFLAGS := -X 'main.orgPublicKeyPEM=$(_PEM_ESCAPED)' \
            -X 'main.version=$(VERSION)'
 
 # ── Development ──────────────────────────────────────────────
-
 .PHONY: build
 build:
-	go build -ldflags "$(LDFLAGS)" -o bin/sentinel ./cmd/sentinel
-
-.PHONY: test
-test:
-	go test ./... -v -count=1
-
-.PHONY: lint
-lint:
-	go vet ./...
-
-# ── Production (garble-obfuscated) ───────────────────────────
+    go build -ldflags "$(LDFLAGS)" -o bin/sentinel ./cmd/sentinel
 
 .PHONY: build-prod
 build-prod:
-	garble -literals -tiny -seed=random build \
-		-ldflags "$(LDFLAGS)" -o bin/sentinel ./cmd/sentinel
+    garble -literals -tiny -seed=random build \
+        -ldflags "$(LDFLAGS)" -o bin/sentinel ./cmd/sentinel
 
-# ── Cross-compilation (garble, all 5 platforms) ──────────────
-
-.PHONY: build-linux-amd64
-build-linux-amd64:
-	GOOS=linux GOARCH=amd64 garble -literals -tiny -seed=random build \
-		-ldflags "$(LDFLAGS)" -o bin/sentinel-linux-amd64 ./cmd/sentinel
-
-.PHONY: build-linux-arm64
-build-linux-arm64:
-	GOOS=linux GOARCH=arm64 garble -literals -tiny -seed=random build \
-		-ldflags "$(LDFLAGS)" -o bin/sentinel-linux-arm64 ./cmd/sentinel
-
-.PHONY: build-darwin-arm64
-build-darwin-arm64:
-	GOOS=darwin GOARCH=arm64 garble -literals -tiny -seed=random build \
-		-ldflags "$(LDFLAGS)" -o bin/sentinel-darwin-arm64 ./cmd/sentinel
-
-.PHONY: build-windows-amd64
-build-windows-amd64:
-	GOOS=windows GOARCH=amd64 garble -literals -tiny -seed=random build \
-		-ldflags "$(LDFLAGS)" -o bin/sentinel-windows-amd64.exe ./cmd/sentinel
-
-.PHONY: build-windows-arm64
-build-windows-arm64:
-	GOOS=windows GOARCH=arm64 garble -literals -tiny -seed=random build \
-		-ldflags "$(LDFLAGS)" -o bin/sentinel-windows-arm64.exe ./cmd/sentinel
-
-.PHONY: build-all
-build-all: build-linux-amd64 build-linux-arm64 build-darwin-arm64 \
-           build-windows-amd64 build-windows-arm64
-
-# ── Utility ──────────────────────────────────────────────────
-
-.PHONY: clean
-clean:
-	rm -rf bin/
-
-.PHONY: fmt
-fmt:
-	gofmt -s -w .
-
-.PHONY: deps
-deps:
-	go mod tidy
+# Cross-compilation targets (5 platforms), test, lint, fmt, clean, deps
+# See Makefile for full content.
 ```
+
+### Why `ORG_PUBLIC_KEY_PEM_FILE` instead of inline PEM
+
+Passing a multiline PEM string directly on the command line
+(`ORG_PUBLIC_KEY_PEM="$(cat key.pem)"`) breaks shell quoting because the PEM contains
+real newlines. Using a file path avoids this: the Makefile reads the file via `awk`
+and replaces each newline with a literal `\n` before passing the value to `-ldflags`.
 
 ### Garble Flags
 
@@ -460,27 +466,37 @@ deps:
 | `-tiny` | Strip file names, line numbers, and other debug info. Reduces binary size and makes stack traces opaque. |
 | `-seed=random` | Randomize obfuscation seed per build. Prevents pattern recognition across builds. |
 
+### Go Version Requirement
+
+Garble patches the Go linker and requires explicit support for each Go version.
+The Makefile and module are pinned to **Go 1.25.7** (`go 1.25.0` + `toolchain go1.25.7`
+in `go.mod`).
+
+- Garble v0.15.0 supports Go ≤ 1.25. **Go 1.26+ breaks garble** with
+  `"Go linker patches aren't available for go1.26 or later yet"`.
+- Garble itself requires Go ≥ 1.25 to compile (its own `go.mod` minimum).
+- Do not upgrade Go past 1.25 until garble releases support for the new version.
+
 ### Build Usage
 
 **Dev build** (no obfuscation, fast):
 ```bash
-make build ORG_PUBLIC_KEY_PEM="$(cat key.pem)"
+make build ORG_PUBLIC_KEY_PEM_FILE=org_pubkey.pem
 ```
 
 **Production build for a specific org**:
 ```bash
-make build-prod ORG_PUBLIC_KEY_PEM="$(cat /path/to/org_public_key.pem)" VERSION="1.0.0"
+make build-prod ORG_PUBLIC_KEY_PEM_FILE=org_pubkey.pem VERSION=1.0.0
 ```
 
 **All platforms**:
 ```bash
-make build-all ORG_PUBLIC_KEY_PEM="$(cat key.pem)" VERSION="1.0.0"
+make build-all ORG_PUBLIC_KEY_PEM_FILE=org_pubkey.pem VERSION=1.0.0
 ```
 
 ### Garble Installation
 
-Garble is a build tool, not a library dependency. Install it separately:
-
+Garble is a build tool, not a library dependency. Install it with Go 1.25:
 ```bash
 go install mvdan.cc/garble@latest
 ```
@@ -508,16 +524,16 @@ These are noted for future phases:
 
 ## Done Criteria
 
-- [ ] `isDebuggerAttached()` returns false in normal execution
-- [ ] `isDebuggerAttached()` returns true when a debugger is attached (manual test)
-- [ ] Degradation stages progress over time after detection
-- [ ] `StageWarnings`: warning messages appear on stderr
-- [ ] `StageErrors`: IPC responses are intermittently corrupted/missing
-- [ ] `StageSlowdown`: CPU and memory usage visibly increase
-- [ ] `StageCrash`: process exits with a plausible error after delay
-- [ ] Anti-tamper monitor runs with random jitter (not predictable interval)
-- [ ] `make build` produces a working binary with embedded public key
-- [ ] `make build-prod` produces a garble-obfuscated binary
-- [ ] `make build-all` produces binaries for all 5 platforms
-- [ ] Garble `-literals` flag hides string literals (verify with `strings` command)
-- [ ] `garble` tool installation documented ← user action required
+- [x] `isDebuggerAttached()` returns false in normal execution
+- [x] `isDebuggerAttached()` returns true when a debugger is attached (manual test)
+- [x] Degradation stages progress over time after detection
+- [x] `StageWarnings`: warning messages appear on stderr (separate goroutine, 15-30s interval)
+- [x] `StageErrors`: IPC responses are intermittently corrupted/missing
+- [x] `StageSlowdown`: CPU and memory usage visibly increase
+- [x] `StageCrash`: process exits with a plausible error after delay (exit code 137)
+- [x] Anti-tamper monitor runs with random jitter (5-10s interval, ±30s stage transition jitter)
+- [x] `make build ORG_PUBLIC_KEY_PEM_FILE=...` produces a working binary with embedded public key
+- [x] `make build-prod ORG_PUBLIC_KEY_PEM_FILE=...` produces a garble-obfuscated binary
+- [x] `make build-all ORG_PUBLIC_KEY_PEM_FILE=...` produces binaries for all 5 platforms
+- [x] Garble `-literals` flag hides string literals (verify with `strings` command)
+- [x] Garble tool installed with `go install mvdan.cc/garble@latest` (Go 1.25 required)

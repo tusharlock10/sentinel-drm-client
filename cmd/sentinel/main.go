@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/tusharlock10/sentinel-drm-client/internal/config"
@@ -47,6 +48,10 @@ func run(cmd *cobra.Command, args []string) error {
 	if orgPublicKeyPEM == "" {
 		return fmt.Errorf("this binary was built without an embedded organization public key; rebuild with -ldflags \"-X main.orgPublicKeyPEM=...\"")
 	}
+
+	// The Makefile embeds the PEM with literal \n to avoid shell quoting issues.
+	// Restore real newlines before parsing.
+	orgPublicKeyPEM = strings.ReplaceAll(orgPublicKeyPEM, `\n`, "\n")
 
 	orgPubKey, err := crypto.ParseECPublicKeyPEM(orgPublicKeyPEM)
 	if err != nil {

@@ -27,13 +27,13 @@ Phase 3 when it is first used. Adding it here without any call sites would cause
 
 ## Files Created / Modified
 
-| File | Action |
-|---|---|
-| `go.mod` | Modified — Go version updated to 1.26; cobra added |
-| `cmd/sentinel/main.go` | Rewritten — cobra root command, embedded key var, flag parsing |
-| `internal/config/config.go` | Created — Config struct, validation |
-| `internal/crypto/crypto.go` | Created — all crypto utilities |
-| `internal/crypto/crypto_test.go` | Created — unit tests covering all Done Criteria |
+| File                             | Action                                                         |
+| -------------------------------- | -------------------------------------------------------------- |
+| `go.mod`                         | Modified — Go version updated to 1.25; cobra added             |
+| `cmd/sentinel/main.go`           | Rewritten — cobra root command, embedded key var, flag parsing |
+| `internal/config/config.go`      | Created — Config struct, validation                            |
+| `internal/crypto/crypto.go`      | Created — all crypto utilities                                 |
+| `internal/crypto/crypto_test.go` | Created — unit tests covering all Done Criteria                |
 
 ---
 
@@ -332,7 +332,7 @@ func SHA256File(path string) (string, error) {
 
 ## Done Criteria
 
-- [x] `go.mod` updated with Go 1.26 and cobra dependency
+- [x] `go.mod` updated with Go 1.25 and cobra dependency
 - [x] `cmd/sentinel/main.go` uses cobra root command with `--license` and `--software` flags (server URL is embedded in the license file, not a CLI flag)
 - [x] Embedded `orgPublicKeyPEM` variable validated at startup (empty = exit with error)
 - [x] `internal/config/config.go` validates that license and software files exist on disk

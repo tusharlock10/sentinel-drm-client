@@ -14,6 +14,7 @@ import (
 	"github.com/awnumar/memguard"
 	"github.com/google/uuid"
 
+	"github.com/tusharlock10/sentinel-drm-client/internal/antitamper"
 	"github.com/tusharlock10/sentinel-drm-client/internal/config"
 	"github.com/tusharlock10/sentinel-drm-client/internal/crypto"
 	"github.com/tusharlock10/sentinel-drm-client/internal/drm"
@@ -214,10 +215,13 @@ func (s *Sentinel) runStandard(ctx context.Context) error {
 
 	go ipcSrv.Serve(ctx) //nolint:errcheck
 
-	// Step 10: Start heartbeat loop.
+	// Step 10: Start anti-tamper monitor.
+	go antitamper.NewMonitor(ipcSrv).Start(ctx)
+
+	// Step 11: Start heartbeat loop.
 	go s.heartbeatLoop(ctx, st, stateMgr, drmClient)
 
-	// Step 11: Wait for software exit or shutdown signal.
+	// Step 12: Wait for software exit or shutdown signal.
 	select {
 	case <-proc.Exited():
 		s.cleanup(st, stateMgr)
@@ -433,7 +437,10 @@ func (s *Sentinel) runHardwareBound(ctx context.Context) error {
 
 	go ipcSrv.Serve(ctx) //nolint:errcheck
 
-	// Step 5: Wait for software exit or shutdown signal. No heartbeat loop — fully offline.
+	// Step 5: Start anti-tamper monitor.
+	go antitamper.NewMonitor(ipcSrv).Start(ctx)
+
+	// Step 6: Wait for software exit or shutdown signal. No heartbeat loop — fully offline.
 	select {
 	case <-proc.Exited():
 		_ = ipcSrv.Close()

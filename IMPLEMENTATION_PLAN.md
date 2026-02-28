@@ -1,8 +1,8 @@
 # Sentinel DRM Client — Detailed Implementation Plan
 
-**Status**: In Progress
+**Status**: Complete
 **Last Updated**: 2026-02-28
-**Phases Complete**: 1, 2, 3, 4, 5, 6, 7
+**Phases Complete**: 1, 2, 3, 4, 5, 6, 7, 8
 
 ---
 
@@ -796,22 +796,34 @@ On SIGINT/SIGTERM:
 
 ---
 
-## 10. Phase 8 — Anti-Tamper, Degradation, and Build System
+## 10. Phase 8 — Anti-Tamper, Degradation, and Build System ✓
 
 ### Files (Anti-Tamper)
 
 - `internal/antitamper/antitamper.go` — orchestrator + degradation state machine
-- `internal/antitamper/antitamper_linux.go`
-- `internal/antitamper/antitamper_darwin.go`
-- `internal/antitamper/antitamper_windows.go`
+- `internal/antitamper/antitamper_linux.go` — TracerPid check
+- `internal/antitamper/antitamper_darwin.go` — sysctl P_TRACED check
+- `internal/antitamper/antitamper_windows.go` — IsDebuggerPresent check
+- `internal/antitamper/antitamper_other.go` — no-op fallback for unsupported platforms
+- `internal/sentinel/sentinel.go` — modified: monitor started after IPC server in both license flows
+- `cmd/sentinel/main.go` — modified: unescape PEM newlines embedded by Makefile
 
 ### Detection Methods
 
 | Check | Linux | macOS | Windows |
 |---|---|---|---|
-| Debugger attached | `/proc/self/status` TracerPid | `sysctl kern.proc.pid` P_TRACED flag | `IsDebuggerPresent()` + `CheckRemoteDebuggerPresent()` via syscall |
+| Debugger attached | `/proc/self/status` TracerPid field | `unix.SysctlKinfoProc` → `info.Proc.P_flag & pTraced` | `IsDebuggerPresent()` + `CheckRemoteDebuggerPresent()` via `kernel32.dll` |
 
 Periodic checks every 5-10 seconds with random jitter to avoid predictable timing.
+Initial check also runs at startup before the loop.
+
+**macOS implementation note**: `KERN_PROC`, `KERN_PROC_PID`, and `P_TRACED` are not
+exported by `golang.org/x/sys/unix`. Use `unix.SysctlKinfoProc("kern.proc.pid", pid)`
+and the local constant `pTraced = 0x00000800`. The struct field is `info.Proc.P_flag`
+(type `ExternProc`, not `Kproc`).
+
+**Linux implementation note**: Only the TracerPid check is used. The ptrace self-check
+(`PTRACE_TRACEME`) was rejected as unsafe in Go's multithreaded runtime.
 
 ### Degradation State Machine
 
@@ -821,32 +833,38 @@ On tamper detection, DO NOT immediately kill. Progress through degradation stage
 type DegradeStage int
 const (
     StageNormal   DegradeStage = iota
-    StageWarnings               // random cryptic warnings to stdout/stderr
-    StageErrors                 // random genuine-looking errors
+    StageWarnings               // cryptic warning messages to stderr
+    StageErrors                 // inject errors into IPC responses
     StageSlowdown               // increased CPU/memory usage
-    StageCrash                  // eventual self-crash
+    StageCrash                  // eventual self-crash (exit 137)
 )
 ```
 
-**Timeline after detection (with random jitter):**
+**Timeline after detection (with ±30s random jitter per stage transition):**
 
 | Time | Stage | Behavior |
 |---|---|---|
-| 0-2 min | `StageWarnings` | Occasional mysterious log messages |
-| 2-5 min | `StageErrors` | Inject fake errors into IPC responses |
-| 5-10 min | `StageSlowdown` | Allocate memory, spin CPU in goroutines |
-| 10+ min | `StageCrash` | Exit with a generic system error |
+| 0-2 min | `StageWarnings` | Cryptic log messages to stderr every 15-30s |
+| 2-5 min | `StageErrors` | IPC errors + escalated error messages to stderr |
+| 5-10 min | `StageSlowdown` | 50 MB memory allocation + 2 CPU busy-loop goroutines |
+| 10+ min | `StageCrash` | Random 0-60s delay then `os.Exit(137)` |
+
+The ±30s jitter is applied in `progressDegradation` on every call:
+`adjustedElapsed = time.Since(detectedAt) + rand.Intn(61)-30 seconds`.
+
+### Warning Emission
+
+Warning messages are emitted by a **separate goroutine** (`warningLoop`) started by
+`onDetected` when tampering is first detected. The loop reads the current stage on
+each iteration and escalates from warning to error messages when `StageErrors` is
+reached.
 
 ### IPC Degradation
 
-When `StageErrors` or beyond, IPC responses degrade:
-- `get_features` returns partial/empty features
-- `get_license` returns errors intermittently
-- Random request failures
-
-This signals the managed software to degrade its own service (bad UX, missing
-features, random errors), making it harder for crackers to identify the
-protection trigger point.
+When `StageErrors` or beyond, IPC responses degrade (implemented in Phase 6 `ipc.go`):
+- `get_features` returns empty features map
+- `get_license` intermittently returns `{status: "error", error: "license validation failed"}`
+- ~30% of all requests fail with a random system error string
 
 ### Anti-Tamper Monitor
 
@@ -854,58 +872,42 @@ protection trigger point.
 type Monitor struct { ... }
 
 func NewMonitor(ipcServer *ipc.Server) *Monitor
-func (m *Monitor) Start(ctx context.Context)
+func (m *Monitor) Start(ctx context.Context)   // run in goroutine
 func (m *Monitor) IsCompromised() bool
 ```
 
 ### Build System (Makefile)
 
+The Makefile accepts the org public key as a **file path** to avoid shell quoting
+issues with multiline PEM strings. The file is read and its newlines are escaped to
+literal `\n` by `awk` before being passed to `-ldflags`. `cmd/sentinel/main.go`
+unescapes `\n` → real newlines at startup before parsing the key.
+
 ```makefile
-VERSION ?= dev
-ORG_PUBLIC_KEY_PEM ?=
+ORG_PUBLIC_KEY_PEM_FILE ?=
 
-LDFLAGS := -X 'main.orgPublicKeyPEM=$(ORG_PUBLIC_KEY_PEM)' \
+_PEM_ESCAPED := $(if $(ORG_PUBLIC_KEY_PEM_FILE),\
+    $(shell awk 'BEGIN{ORS="\\n"} 1' "$(ORG_PUBLIC_KEY_PEM_FILE)"),)
+
+LDFLAGS := -X 'main.orgPublicKeyPEM=$(_PEM_ESCAPED)' \
            -X 'main.version=$(VERSION)'
+```
 
-# Development build (no obfuscation)
-build:
-    go build -ldflags "$(LDFLAGS)" -o bin/sentinel ./cmd/sentinel
-
-# Production build (garble obfuscation)
-build-prod:
-    garble -literals -tiny -seed=random build \
-        -ldflags "$(LDFLAGS)" -o bin/sentinel ./cmd/sentinel
-
-# Cross-compilation targets (5 platforms)
-build-linux-amd64:
-    GOOS=linux GOARCH=amd64 garble ... -o bin/sentinel-linux-amd64 ./cmd/sentinel
-
-build-linux-arm64:
-    GOOS=linux GOARCH=arm64 garble ... -o bin/sentinel-linux-arm64 ./cmd/sentinel
-
-build-darwin-arm64:
-    GOOS=darwin GOARCH=arm64 garble ... -o bin/sentinel-darwin-arm64 ./cmd/sentinel
-
-build-windows-amd64:
-    GOOS=windows GOARCH=amd64 garble ... -o bin/sentinel-windows-amd64.exe ./cmd/sentinel
-
-build-windows-arm64:
-    GOOS=windows GOARCH=arm64 garble ... -o bin/sentinel-windows-arm64.exe ./cmd/sentinel
-
-build-all: build-linux-amd64 build-linux-arm64 build-darwin-arm64 \
-           build-windows-amd64 build-windows-arm64
-
-test:
-    go test ./... -v
-
-clean:
-    rm -rf bin/
+**Usage:**
+```bash
+make build ORG_PUBLIC_KEY_PEM_FILE=org_pubkey.pem            # dev
+make build-prod ORG_PUBLIC_KEY_PEM_FILE=org_pubkey.pem VERSION=1.0.0  # production
+make build-all  ORG_PUBLIC_KEY_PEM_FILE=org_pubkey.pem VERSION=1.0.0  # all 5 platforms
 ```
 
 Garble flags:
 - `-literals` — obfuscate string literals (hides embedded public key, error messages)
 - `-tiny` — strip extra info
 - `-seed=random` — randomize obfuscation per build
+
+**Go version requirement**: Pinned to Go 1.25.7 (`go 1.25.0` + `toolchain go1.25.7`
+in `go.mod`). Garble v0.15.0 does not support Go 1.26+. Do not upgrade Go past 1.25
+until garble releases support for the new version.
 
 ---
 
@@ -996,9 +998,14 @@ Phase 7 ✓ Main orchestrator
           ├── internal/config/config.go      added Version field (threaded from main ldflags var)
           └── cmd/sentinel/main.go           wired: SetupSignalHandler(), sentinel.New(), Run()
 
-Phase 8   Anti-tamper, degradation, and build system
-          ├── internal/antitamper/          debugger detection, degradation stages
-          └── Makefile                      garble builds, cross-compilation
+Phase 8 ✓ Anti-tamper, degradation, and build system
+          ├── internal/antitamper/antitamper.go         Monitor struct, degradation state machine
+          ├── internal/antitamper/antitamper_linux.go   TracerPid check (/proc/self/status)
+          ├── internal/antitamper/antitamper_darwin.go  sysctl KinfoProc P_TRACED check
+          ├── internal/antitamper/antitamper_windows.go IsDebuggerPresent + CheckRemoteDebuggerPresent
+          ├── internal/antitamper/antitamper_other.go   no-op fallback for unsupported platforms
+          ├── internal/sentinel/sentinel.go             wired antitamper monitor (both license flows)
+          └── Makefile                                  garble builds, cross-compilation (5 platforms)
 ```
 
 ---
@@ -1019,3 +1026,7 @@ Phase 8   Anti-tamper, degradation, and build system
 | Machine keypair storage | OS keystore | Private key never on disk in plaintext |
 | Canonical JSON | Sorted keys, compact, ASCII-only | Must be byte-identical with Python backend output |
 | Obfuscation | garble with -literals -tiny | Hides string literals and embedded keys in binary |
+| Anti-tamper Linux | TracerPid only (no ptrace self-check) | ptrace PTRACE_TRACEME is unsafe in Go's multithreaded runtime |
+| Anti-tamper macOS | `unix.SysctlKinfoProc` + `info.Proc.P_flag` | High-level wrapper; raw Syscall6 approach had unexported constant names |
+| PEM embedding in ldflags | File path + awk newline escaping + runtime unescape | `-ldflags -X` cannot handle multiline strings; awk converts `\n` → `\n` literal |
+| Go version pinned | go 1.25.0 + toolchain go1.25.7 | garble v0.15.0 requires Go ≤ 1.25; toolchain directive prevents silent upgrades |
