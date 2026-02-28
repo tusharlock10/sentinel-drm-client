@@ -1,6 +1,6 @@
 # Phase 6 — Process Management and IPC
 
-**Status**: Pending
+**Status**: Complete
 **Depends on**: Phase 1
 
 ---
@@ -19,10 +19,16 @@
 
 | File | Action |
 |---|---|
-| `internal/process/process.go` | Created — launch, monitor, signal, stop |
-| `internal/ipc/ipc.go` | Created — protocol definition, server logic, degrade hook |
+| `internal/process/process.go` | Created — launch, monitor, signal, stop, checksum |
+| `internal/process/process_unix.go` | Created — `Stop()` with SIGTERM → 10s → SIGKILL |
+| `internal/process/process_windows.go` | Created — `Stop()` with direct `Kill()` (no SIGTERM on Windows) |
+| `internal/process/process_test.go` | Created — 5 tests; uses TestMain subprocess trick |
+| `internal/ipc/ipc.go` | Created — protocol types, server logic, `SocketPath()`, degrade stubs |
 | `internal/ipc/ipc_unix.go` | Created — Unix domain socket listener (Linux/macOS) |
-| `internal/ipc/ipc_windows.go` | Created — Named pipe listener (Windows) |
+| `internal/ipc/ipc_windows.go` | Created — Named pipe listener via `github.com/Microsoft/go-winio` |
+| `internal/ipc/ipc_test.go` | Created — 7 tests; handler unit tests + server integration test |
+| `internal/ipc/ipc_unix_test.go` | Created — `dialSocket` helper for integration test (Linux/macOS) |
+| `internal/ipc/ipc_windows_test.go` | Created — `dialSocket` helper using `winio.DialPipe` (Windows) |
 
 ---
 
@@ -114,7 +120,9 @@ func (m *Manager) Signal(sig os.Signal) {
 
 ### `Stop() error`
 
-Graceful shutdown: send SIGTERM, wait up to 10 seconds, then SIGKILL.
+Graceful shutdown. Implemented in platform-specific files.
+
+**`process_unix.go`** (`//go:build !windows`): send SIGTERM, wait up to 10 seconds, then SIGKILL.
 
 ```go
 func (m *Manager) Stop() error {
@@ -131,9 +139,20 @@ func (m *Manager) Stop() error {
 }
 ```
 
-On Windows, `SIGTERM` doesn't exist. Use `cmd.Process.Kill()` directly as the
-graceful shutdown mechanism (Windows processes handle `WM_CLOSE` or
-`GenerateConsoleCtrlEvent` for Ctrl+C — but for simplicity, just kill).
+**`process_windows.go`** (`//go:build windows`): `SIGTERM` does not exist on Windows;
+`Kill()` is called directly.
+
+```go
+func (m *Manager) Stop() error {
+    m.mu.Lock()
+    if m.cmd.Process != nil {
+        m.cmd.Process.Kill()
+    }
+    m.mu.Unlock()
+    <-m.exited
+    return m.exitErr
+}
+```
 
 ### Software Binary Checksum Verification
 
@@ -212,10 +231,11 @@ Unknown methods return: `{status: "error", error: "unknown method: xyz"}`.
 
 ```go
 type Server struct {
-    listener    net.Listener
-    licenseInfo *LicenseInfo
+    socketPath   string
+    listener     net.Listener
+    licenseInfo  *LicenseInfo
     degradeStage atomic.Int32 // DegradeStage cast to int32
-    mu          sync.Mutex
+    mu           sync.Mutex
 }
 
 func NewServer(socketPath string, info *LicenseInfo) (*Server, error)
@@ -223,6 +243,9 @@ func (s *Server) Serve(ctx context.Context) error
 func (s *Server) Close() error
 func (s *Server) SetDegradeStage(stage DegradeStage)
 ```
+
+`socketPath` is stored so that `Close()` can pass it to `cleanupListener` to remove
+the socket file on Unix (named pipes on Windows are cleaned up automatically).
 
 #### `NewServer`
 
@@ -264,24 +287,20 @@ func (s *Server) handleConnection(conn net.Conn) {
 func (s *Server) handleRequest(req Request) Response {
     stage := DegradeStage(s.degradeStage.Load())
 
-    // In degradation mode, inject errors
-    if stage >= StageErrors {
-        if shouldInjectError(stage) {
-            return Response{Status: "error", Error: randomSystemError()}
-        }
+    if stage >= StageErrors && shouldInjectError() {
+        return Response{Status: "error", Error: randomSystemError()}
     }
 
     switch req.Method {
     case "get_license":
         if stage >= StageErrors {
-            // Return partial/corrupted license info
-            return degradedLicenseResponse(s.licenseInfo, stage)
+            return degradedLicenseResponse(s.licenseInfo)
         }
         return Response{Status: "ok", License: s.licenseInfo}
 
     case "get_features":
         if stage >= StageErrors {
-            return Response{Status: "ok", Features: degradedFeatures(s.licenseInfo.Features, stage)}
+            return Response{Status: "ok", Features: degradedFeatures(s.licenseInfo.Features)}
         }
         return Response{Status: "ok", Features: s.licenseInfo.Features}
 
@@ -294,7 +313,10 @@ func (s *Server) handleRequest(req Request) Response {
 }
 ```
 
-The degradation logic is stubbed here and fully implemented in Phase 8.
+The degradation stubs (`shouldInjectError`, `randomSystemError`, `degradedLicenseResponse`,
+`degradedFeatures`) are minimal stubs in this phase and will be fully replaced in Phase 8.
+Note that the stub functions do NOT take a `stage` parameter — Phase 8 will introduce
+more nuanced per-stage behaviour and can add it then.
 
 #### `SetDegradeStage(stage DegradeStage)`
 
@@ -319,6 +341,16 @@ Closes the listener and cleans up the socket file (Unix) or pipe handle (Windows
 
 The `<machine_id>` is the machine's UUID from the state file, ensuring each
 Sentinel instance has a unique socket.
+
+An exported helper constructs the platform-appropriate path:
+
+```go
+func SocketPath(machineID string) string
+```
+
+The Phase 7 orchestrator calls `ipc.SocketPath(state.MachineID)` to get the path,
+passes it to `ipc.NewServer`, and also passes it as `SENTINEL_IPC_SOCKET` in the
+child's environment so the managed software knows where to connect.
 
 ### Unix Socket — `ipc_unix.go`
 
@@ -352,25 +384,28 @@ func cleanupListener(socketPath string) {
 }
 ```
 
-**Note on Windows named pipes**: The `github.com/microsoft/go-winio` package
-provides named pipe support. This is a Windows-only dependency (build-tagged).
-If the dependency is too heavy, an alternative is to use a TCP listener on
-`127.0.0.1:<random port>` on Windows only. This should be discussed with the user.
+**Dependency**: `github.com/Microsoft/go-winio` (note capital M) is used for named pipe
+support. It is build-tagged Windows-only so it does not affect Linux/macOS builds.
+The import path is `github.com/Microsoft/go-winio` — the lowercase variant
+(`github.com/microsoft/go-winio`) is a module redirect that resolves to the same
+package, but the `go.mod` canonical path is the capitalized form.
 
 ---
 
 ## Done Criteria
 
-- [ ] `Launch` starts a child process and connects its stdout/stderr
-- [ ] `Wait` blocks until the child exits
-- [ ] `Exited()` channel closes when the child exits
-- [ ] `Stop` sends SIGTERM, waits 10s, then SIGKILL
-- [ ] `SENTINEL_IPC_SOCKET` env var is set in the child's environment
-- [ ] `VerifyBinaryChecksum` computes correct SHA-256 and compares
-- [ ] IPC server accepts connections on Unix domain socket (Linux/macOS)
-- [ ] IPC `get_license` returns full license info
-- [ ] IPC `get_features` returns features map
-- [ ] IPC `health` returns ok
-- [ ] IPC unknown method returns error
-- [ ] IPC `SetDegradeStage` changes response behavior (stub for Phase 8)
-- [ ] Socket file is cleaned up on server close
+- [x] `Launch` starts a child process and connects its stdout/stderr
+- [x] `Wait` blocks until the child exits
+- [x] `Exited()` channel closes when the child exits
+- [x] `Stop` sends SIGTERM, waits 10s, then SIGKILL (Unix); direct `Kill()` on Windows
+- [x] `SENTINEL_IPC_SOCKET` env var is set in the child's environment
+- [x] `VerifyBinaryChecksum` computes correct SHA-256 and compares
+- [x] IPC server accepts connections on Unix domain socket (Linux/macOS) and named pipe (Windows)
+- [x] IPC `get_license` returns full license info
+- [x] IPC `get_features` returns features map
+- [x] IPC `health` returns ok
+- [x] IPC unknown method returns error
+- [x] IPC `SetDegradeStage` changes response behavior (stub for Phase 8)
+- [x] Socket file is cleaned up on server close
+
+**Tests**: 5 passing in `internal/process/`, 7 passing in `internal/ipc/`

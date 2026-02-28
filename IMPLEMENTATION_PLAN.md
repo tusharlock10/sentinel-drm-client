@@ -2,7 +2,7 @@
 
 **Status**: In Progress
 **Last Updated**: 2026-02-28
-**Phases Complete**: 1, 2, 3, 4, 5
+**Phases Complete**: 1, 2, 3, 4, 5, 6
 
 ---
 
@@ -585,11 +585,13 @@ func (c *Client) DecommissionAck(req DecommissionAckRequest) (*DecommissionAckRe
 
 ---
 
-## 8. Phase 6 — Process Management and IPC
+## 8. Phase 6 — Process Management and IPC ✓
 
 ### Files (Process)
 
-- `internal/process/process.go`
+- `internal/process/process.go` — Manager, Launch, Wait, Exited, Signal, VerifyBinaryChecksum
+- `internal/process/process_unix.go` — Stop() with SIGTERM → 10s → SIGKILL
+- `internal/process/process_windows.go` — Stop() with direct Kill() (no SIGTERM on Windows)
 
 ### Process Management
 
@@ -621,9 +623,9 @@ func VerifyBinaryChecksum(binaryPath string, expectedChecksum string) error
 
 ### Files (IPC)
 
-- `internal/ipc/ipc.go` — protocol + server logic
+- `internal/ipc/ipc.go` — protocol types, Server, Serve, SocketPath helper, degradation stubs
 - `internal/ipc/ipc_unix.go` — Unix domain socket listener (Linux/macOS)
-- `internal/ipc/ipc_windows.go` — Named pipe listener (Windows)
+- `internal/ipc/ipc_windows.go` — Named pipe listener via `github.com/Microsoft/go-winio` (Windows)
 
 ### IPC Protocol
 
@@ -670,7 +672,7 @@ type LicenseInfo struct {
 ### Server
 
 ```go
-type Server struct { ... }
+func SocketPath(machineID string) string  // "/tmp/sentinel-<id>.sock" or "\\.\pipe\sentinel-<id>"
 
 func NewServer(socketPath string, info *LicenseInfo) (*Server, error)
 func (s *Server) Serve(ctx context.Context) error
@@ -678,8 +680,8 @@ func (s *Server) Close() error
 func (s *Server) SetDegradeStage(stage DegradeStage) // for anti-tamper (Phase 8)
 ```
 
-Accept one connection at a time. Each connection handled in a goroutine reading
-JSON lines and writing JSON line responses.
+Multiple concurrent connections are accepted; each is handled in its own goroutine
+reading JSON lines and writing JSON line responses.
 
 ---
 
@@ -911,11 +913,13 @@ Garble flags:
 
 External Go dependencies:
 
-| Dependency | Purpose | Justification |
+| Dependency | Purpose | Added |
 |---|---|---|
-| `github.com/spf13/cobra` | CLI framework | Mentioned in CLAUDE.md. Single root command with flags |
-| `github.com/awnumar/memguard` | Secure memory for private keys | Mentioned in CLAUDE.md. Prevents key material from being swapped to disk. Added in Phase 7 when the full key lifecycle is first wired together. |
-| `mvdan.cc/garble` | Binary obfuscation | Mentioned in CLAUDE.md. Build tool only, not a library dependency |
+| `github.com/spf13/cobra` | CLI framework — single root command with flags | Phase 1 |
+| `github.com/google/uuid` | UUID v4 nonce generation in DRM request signing | Phase 5 |
+| `github.com/Microsoft/go-winio` | Windows named pipe IPC (`\\.\pipe\...`); build-tagged Windows-only | Phase 6 |
+| `github.com/awnumar/memguard` | Secure memory for private keys — prevents key material swapping to disk | Phase 7 |
+| `mvdan.cc/garble` | Binary obfuscation (build tool only, not a library dependency) | Phase 8 |
 
 Everything else uses Go stdlib: `crypto/ecdsa`, `crypto/elliptic`, `crypto/sha256`,
 `crypto/aes`, `crypto/cipher`, `crypto/rand`, `encoding/json`, `encoding/pem`,
@@ -974,9 +978,17 @@ Phase 5 ✓ DRM server communication
           │                                with request signing + response verification
           └── internal/drm/drm_test.go     12 tests, all passing (httptest mock backend)
 
-Phase 6   Process management and IPC
-          ├── internal/process/process.go  launch, monitor, stop child process
-          └── internal/ipc/                Unix socket / named pipe, JSON protocol
+Phase 6 ✓ Process management and IPC
+          ├── internal/process/process.go         launch, monitor, stop, checksum verification
+          ├── internal/process/process_unix.go    Stop() — SIGTERM → 10s → SIGKILL
+          ├── internal/process/process_windows.go Stop() — direct Kill()
+          ├── internal/process/process_test.go    5 tests, all passing
+          ├── internal/ipc/ipc.go                 protocol types, server, SocketPath()
+          ├── internal/ipc/ipc_unix.go            Unix domain socket listener
+          ├── internal/ipc/ipc_windows.go         named pipe listener (go-winio)
+          ├── internal/ipc/ipc_test.go            7 tests, all passing
+          ├── internal/ipc/ipc_unix_test.go       dialSocket helper (Linux/macOS)
+          └── internal/ipc/ipc_windows_test.go    dialSocket helper (Windows)
 
 Phase 7   Main orchestrator
           └── internal/sentinel/sentinel.go  STANDARD + HARDWARE_BOUND flows,
