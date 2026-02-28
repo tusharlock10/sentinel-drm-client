@@ -78,19 +78,38 @@ func (s *Sentinel) Run(ctx context.Context) error {
 
 ### Step 2: Initialize Keystore
 
+The vault key is derived from the machine's stable identifier. This ties the
+keystore file to this machine — copying it to another machine yields undecryptable
+data. `memguard` is introduced here to protect key material in memory.
+
 ```go
-ks := keystore.New()
+machineID, err := hardware.GetMachineID()
+if err != nil {
+    return fmt.Errorf("get machine ID for keystore: %w", err)
+}
+vaultKey := keystore.DeriveVaultKey(machineID)
+
+keystorePath, err := keystore.DefaultFilePath()
+if err != nil {
+    return fmt.Errorf("get keystore path: %w", err)
+}
+ks, err := keystore.New(keystorePath, vaultKey)
+if err != nil {
+    return fmt.Errorf("initialize keystore: %w", err)
+}
 ```
 
 ### Step 3: Load or Generate Machine Keypair
 
 ```go
 privPEM, err := ks.Retrieve(keystore.KeyMachinePrivateKey)
-if err != nil {
+if errors.Is(err, keystore.ErrNotFound) {
     // First run or keystore cleared — generate new keypair
     privKey, err := crypto.GenerateECKeyPair()
     privPEM, err = crypto.ECPrivateKeyToPEM(privKey)
     ks.Store(keystore.KeyMachinePrivateKey, privPEM)
+} else if err != nil {
+    return fmt.Errorf("retrieve machine private key: %w", err)
 }
 machineKey, err := crypto.ParseECPrivateKeyPEM(privPEM)
 machinePublicPEM, err := crypto.ECPublicKeyToPEM(&machineKey.PublicKey)
@@ -98,6 +117,8 @@ machinePublicPEM, err := crypto.ECPublicKeyToPEM(&machineKey.PublicKey)
 
 Use `memguard` to protect the private key bytes in memory (wrap in a `LockedBuffer`
 that prevents the memory from being swapped to disk or appearing in core dumps).
+`memguard` is added as a dependency in this phase (Phase 7), when the full key
+lifecycle is first wired together.
 
 ### Step 4: Load or Create State
 

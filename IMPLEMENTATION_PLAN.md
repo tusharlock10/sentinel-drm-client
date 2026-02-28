@@ -2,6 +2,7 @@
 
 **Status**: In Progress
 **Last Updated**: 2026-02-28
+**Phases Complete**: 1, 2, 3
 
 ---
 
@@ -74,8 +75,8 @@ sentinel-drm-client/
 │   │   ├── hardware_linux.go
 │   │   ├── hardware_darwin.go
 │   │   └── hardware_windows.go
-│   ├── keystore/                  # OS keystore abstraction
-│   │   └── keystore.go            # Uses go-keyring (cross-platform)
+│   ├── keystore/                  # File-based AES-256-GCM keystore
+│   │   └── keystore.go            # Vault key passed in by caller (derived in Phase 7)
 │   ├── state/                     # Encrypted local state file management
 │   │   └── state.go
 │   ├── drm/                       # DRM server communication
@@ -287,11 +288,11 @@ type LicensePayload struct {
 
 ---
 
-## 5. Phase 3 — Hardware Fingerprint and OS Keystore
+## 5. Phase 3 — Hardware Fingerprint and File-Based Keystore ✓
 
 ### Files (Hardware)
 
-- `internal/hardware/hardware.go` — interface + SHA-256 computation
+- `internal/hardware/hardware.go` — `CollectFingerprint()` + `GetMachineID()` + SHA-256
 - `internal/hardware/hardware_linux.go`
 - `internal/hardware/hardware_darwin.go`
 - `internal/hardware/hardware_windows.go`
@@ -300,17 +301,22 @@ type LicensePayload struct {
 
 ```go
 func CollectFingerprint() (string, error)
+func GetMachineID() (string, error)
 ```
 
-Returns `SHA256Hex(cpuSerial + diskSerial + machineID)`.
+`CollectFingerprint` returns `SHA256Hex(cpuSerial + diskSerial + machineID)`.
+`GetMachineID` exposes the platform machine ID for keystore vault key derivation in Phase 7.
 
 **Platform-specific collection:**
 
 | Component | Linux | macOS | Windows |
 |---|---|---|---|
-| CPU Serial | `/proc/cpuinfo` Serial or `/sys/class/dmi/id/product_uuid` | `ioreg -rd1 -c IOPlatformExpertDevice` → IOPlatformSerialNumber | WMI `Win32_Processor` → ProcessorId |
-| Disk Serial | `/sys/block/<root>/device/serial` or `lsblk` | `diskutil info /` | WMI `Win32_DiskDrive` → SerialNumber |
-| Machine ID | `/etc/machine-id` | `ioreg` → IOPlatformUUID | Registry `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` |
+| CPU Serial | `/sys/class/dmi/id/product_uuid` (primary), `/proc/cpuinfo` Serial (ARM fallback) | `ioreg -rd1 -c IOPlatformExpertDevice` → IOPlatformSerialNumber | PowerShell `Get-CimInstance Win32_Processor` → ProcessorId |
+| Disk Serial | `findmnt -n -o SOURCE /` → `/sys/block/<device>/serial` | `diskutil info /` → Volume UUID | PowerShell `Get-CimInstance Win32_DiskDrive -Filter 'Index=0'` → SerialNumber |
+| Machine ID | `/etc/machine-id` | `ioreg -rd1 -c IOPlatformExpertDevice` → IOPlatformUUID | PowerShell registry `HKLM:\SOFTWARE\Microsoft\Cryptography` → MachineGuid |
+
+Windows uses `powershell.exe -NoProfile -NonInteractive -Command` for all queries.
+`wmic` is deprecated/removed on Windows 11; `Get-CimInstance` is the correct replacement.
 
 Each platform function must return clear errors if a component cannot be read.
 No fallbacks — fail fast if hardware identity cannot be established.
@@ -319,28 +325,38 @@ No fallbacks — fail fast if hardware identity cannot be established.
 
 - `internal/keystore/keystore.go`
 
-### Keystore Interface
+### Keystore API
 
 ```go
+var ErrNotFound = errors.New("key not found")
+
+const (
+    KeyMachinePrivateKey  = "machine-private-key"
+    KeyStateEncryptionKey = "state-encryption-key"
+)
+
 type Keystore interface {
-    Store(service, key string, data []byte) error
-    Retrieve(service, key string) ([]byte, error)
-    Delete(service, key string) error
+    Store(key string, data []byte) error
+    Retrieve(key string) ([]byte, error)
+    Delete(key string) error
 }
 
-func New() (Keystore, error)
+func New(filePath string, vaultKey [32]byte) (Keystore, error)
+func DefaultFilePath() (string, error)
+func DeriveVaultKey(machineID string) [32]byte
 ```
 
-Uses `github.com/zalando/go-keyring` for cross-platform support:
-- **Linux**: Secret Service API (D-Bus) or kernel keyring
-- **macOS**: Keychain
-- **Windows**: Credential Manager
+File-based AES-256-GCM encrypted keystore. No external dependency.
+Each entry stored as `base64(nonce[12] || ciphertext)` in a JSON file.
+Writes are atomic (`<path>.tmp` → `os.Rename`). File permissions: `0600`.
 
-Service name: `"sentinel-drm"`.
+`DeriveVaultKey` computes `SHA256("sentinel-drm-keystore:" + machineID)`, tying
+the keystore file to the machine. In Phase 7 the orchestrator calls:
+`keystore.New(path, keystore.DeriveVaultKey(hardware.GetMachineID()))`.
 
 Stored items:
-- `"machine-private-key"` — EC P-256 private key (PEM-encoded)
-- `"state-encryption-key"` — 32 bytes for AES-256-GCM state file encryption
+- `KeyMachinePrivateKey` — EC P-256 private key (PEM-encoded)
+- `KeyStateEncryptionKey` — 32 bytes for AES-256-GCM state file encryption
 
 ---
 
@@ -898,8 +914,7 @@ External Go dependencies:
 | Dependency | Purpose | Justification |
 |---|---|---|
 | `github.com/spf13/cobra` | CLI framework | Mentioned in CLAUDE.md. Single root command with flags |
-| `github.com/awnumar/memguard` | Secure memory for private keys | Mentioned in CLAUDE.md. Prevents key material from being swapped to disk. Added in Phase 3 when first used. |
-| `github.com/zalando/go-keyring` | Cross-platform OS keystore | Strong payoff vs implementing 3 platform-specific keystores from scratch |
+| `github.com/awnumar/memguard` | Secure memory for private keys | Mentioned in CLAUDE.md. Prevents key material from being swapped to disk. Added in Phase 7 when the full key lifecycle is first wired together. |
 | `mvdan.cc/garble` | Binary obfuscation | Mentioned in CLAUDE.md. Build tool only, not a library dependency |
 
 Everything else uses Go stdlib: `crypto/ecdsa`, `crypto/elliptic`, `crypto/sha256`,
@@ -942,9 +957,13 @@ Phase 2 ✓ License file parsing and verification
           ├── internal/license/license.go      parse .lic, verify sig, extract payload
           └── internal/license/license_test.go 16 tests, all passing
 
-Phase 3   Hardware fingerprint and OS keystore
-          ├── internal/hardware/           platform-specific fingerprint collection
-          └── internal/keystore/           OS keystore via go-keyring
+Phase 3 ✓ Hardware fingerprint and file-based keystore
+          ├── internal/hardware/hardware.go         CollectFingerprint(), GetMachineID()
+          ├── internal/hardware/hardware_linux.go   DMI UUID / cpuinfo, findmnt+sysfs, machine-id
+          ├── internal/hardware/hardware_darwin.go  ioreg, diskutil, ioreg UUID
+          ├── internal/hardware/hardware_windows.go PowerShell Get-CimInstance, registry
+          └── internal/keystore/keystore.go         New(filePath, vaultKey), DeriveVaultKey(),
+                                                    DefaultFilePath(), ErrNotFound
 
 Phase 4   Encrypted state file
           └── internal/state/state.go      AES-256-GCM encrypted local state
