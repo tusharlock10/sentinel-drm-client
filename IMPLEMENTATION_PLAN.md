@@ -2,7 +2,7 @@
 
 **Status**: In Progress
 **Last Updated**: 2026-02-28
-**Phases Complete**: 1, 2, 3, 4
+**Phases Complete**: 1, 2, 3, 4, 5
 
 ---
 
@@ -969,9 +969,10 @@ Phase 4 ✓ Encrypted state file
           ├── internal/state/state.go      AES-256-GCM encrypted local state
           └── internal/state/state_test.go 11 tests, all passing
 
-Phase 5   DRM server communication
-          └── internal/drm/drm.go          activate, heartbeat, decommission-ack
-                                           with request signing + response verification
+Phase 5 ✓ DRM server communication
+          ├── internal/drm/drm.go          activate, heartbeat, decommission-ack
+          │                                with request signing + response verification
+          └── internal/drm/drm_test.go     12 tests, all passing (httptest mock backend)
 
 Phase 6   Process management and IPC
           ├── internal/process/process.go  launch, monitor, stop child process

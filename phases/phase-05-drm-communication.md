@@ -1,6 +1,6 @@
 # Phase 5 — DRM Server Communication
 
-**Status**: Pending
+**Status**: Complete
 **Depends on**: Phase 1 (crypto), Phase 4 (state)
 
 ---
@@ -30,9 +30,14 @@ Every request to `/api/v1/drm/` includes these HTTP headers:
 ```
 X-Sentinel-Machine-Id:  <machine_id>
 X-Sentinel-Timestamp:   <Unix epoch seconds as integer string>
-X-Sentinel-Nonce:       <UUID v4 string>
+X-Sentinel-Nonce:       <UUID v4 string>  ← generated with github.com/google/uuid
 X-Sentinel-Signature:   <base64url(DER-encoded ECDSA-SHA256 signature)>
 ```
+
+> **Note**: The backend `IMPLEMENTATION_PLAN.md` describes the nonce as a "32-byte
+> cryptographically random hex string" but the backend code accepts any opaque string.
+> UUID v4 is used here (`github.com/google/uuid`). It satisfies the uniqueness requirement
+> and is a well-maintained package that may be used elsewhere in the client.
 
 ### Signing String Construction
 
@@ -141,11 +146,15 @@ func (c *Client) verifyAndDecode(httpResp *http.Response, expectedNonce string, 
     // 7. Unmarshal into target struct
     json.Unmarshal(payloadBytes, target)
 
-    // 8. Verify reflected nonce
-    // target must have a RequestNonce field
-    nonce := extractRequestNonce(target)
-    if nonce != expectedNonce {
-        return fmt.Errorf("response nonce mismatch: expected %s, got %s", expectedNonce, nonce)
+    // 8. Verify reflected nonce — unmarshal payload a second time into a
+    //    nonce-holder struct. No reflection needed; both unmarshals share the
+    //    same already-decoded payloadBytes.
+    var nonceHolder struct {
+        RequestNonce string `json:"request_nonce"`
+    }
+    json.Unmarshal(payloadBytes, &nonceHolder)
+    if nonceHolder.RequestNonce != expectedNonce {
+        return fmt.Errorf("response nonce mismatch: expected %s, got %s", expectedNonce, nonceHolder.RequestNonce)
     }
 
     return nil
@@ -336,16 +345,16 @@ func IsConnectionError(err error) bool {
 
 ## Done Criteria
 
-- [ ] Request signing string matches backend's expected format exactly
-- [ ] Signing string includes correct HTTP method, path, timestamp, nonce, and body hash
-- [ ] Request headers are set correctly (`X-Sentinel-Machine-Id`, `X-Sentinel-Timestamp`,
+- [x] Request signing string matches backend's expected format exactly
+- [x] Signing string includes correct HTTP method, path, timestamp, nonce, and body hash
+- [x] Request headers are set correctly (`X-Sentinel-Machine-Id`, `X-Sentinel-Timestamp`,
   `X-Sentinel-Nonce`, `X-Sentinel-Signature`)
-- [ ] Response signature is verified against org public key
-- [ ] Response nonce mismatch causes error
-- [ ] Backend error responses are parsed into descriptive Go errors
-- [ ] Connection errors are distinguishable from server errors
-- [ ] `DetectPlatform()` returns correct values for all 5 supported platforms
-- [ ] All three endpoints (`Activate`, `Heartbeat`, `DecommissionAck`) correctly
+- [x] Response signature is verified against org public key
+- [x] Response nonce mismatch causes error
+- [x] Backend error responses are parsed into descriptive Go errors
+- [x] Connection errors are distinguishable from server errors
+- [x] `DetectPlatform()` returns correct values for all 5 supported platforms
+- [x] All three endpoints (`Activate`, `Heartbeat`, `DecommissionAck`) correctly
   marshal requests and unmarshal responses
 - [ ] Cross-language test: Go client can communicate with the Python backend
-  (sign request, verify response) — requires running backend
+  (sign request, verify response) — requires running backend (deferred to integration testing)
