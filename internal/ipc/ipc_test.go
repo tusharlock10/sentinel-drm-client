@@ -155,8 +155,31 @@ func TestServerServe(t *testing.T) {
 	}
 	defer conn.Close()
 
-	encoder := json.NewEncoder(conn)
 	scanner := bufio.NewScanner(conn)
+
+	// sendEncrypted encrypts a method request and writes it to conn.
+	sendEncrypted := func(method string) error {
+		data, _ := json.Marshal(Request{Method: method})
+		line, err := encryptMessage(ipcKey, data)
+		if err != nil {
+			return err
+		}
+		_, err = conn.Write([]byte(line + "\n"))
+		return err
+	}
+
+	// recvDecrypted reads one encrypted line from scanner and decrypts it.
+	recvDecrypted := func() (Response, error) {
+		if !scanner.Scan() {
+			return Response{}, scanner.Err()
+		}
+		plaintext, err := decryptMessage(ipcKey, scanner.Text())
+		if err != nil {
+			return Response{}, err
+		}
+		var resp Response
+		return resp, json.Unmarshal(plaintext, &resp)
+	}
 
 	tests := []struct {
 		method       string
@@ -171,15 +194,12 @@ func TestServerServe(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		if err := encoder.Encode(Request{Method: tc.method}); err != nil {
-			t.Fatalf("encode request %q: %v", tc.method, err)
+		if err := sendEncrypted(tc.method); err != nil {
+			t.Fatalf("send request %q: %v", tc.method, err)
 		}
-		if !scanner.Scan() {
-			t.Fatalf("scan response for %q: %v", tc.method, scanner.Err())
-		}
-		var resp Response
-		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
-			t.Fatalf("unmarshal response for %q: %v", tc.method, err)
+		resp, err := recvDecrypted()
+		if err != nil {
+			t.Fatalf("recv response for %q: %v", tc.method, err)
 		}
 		if resp.Status != tc.wantStatus {
 			t.Errorf("%q: expected status %q, got %q", tc.method, tc.wantStatus, resp.Status)

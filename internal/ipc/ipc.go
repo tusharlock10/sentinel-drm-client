@@ -3,11 +3,18 @@ package ipc
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -114,16 +121,33 @@ func (s *Server) SetDegradeStage(stage DegradeStage) {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
-	encoder := json.NewEncoder(conn)
 
 	for scanner.Scan() {
+		plaintext, err := decryptMessage(ipcKey, scanner.Text())
+		if err != nil {
+			// Decryption failure means wrong key or a non-sentinel client — drop silently.
+			return
+		}
+
 		var req Request
-		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
-			encoder.Encode(Response{Status: "error", Error: "malformed request"}) //nolint:errcheck
+		if err := json.Unmarshal(plaintext, &req); err != nil {
+			s.writeEncrypted(conn, Response{Status: "error", Error: "malformed request"})
 			continue
 		}
-		encoder.Encode(s.handleRequest(req)) //nolint:errcheck
+		s.writeEncrypted(conn, s.handleRequest(req))
 	}
+}
+
+func (s *Server) writeEncrypted(conn net.Conn, resp Response) {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	line, err := encryptMessage(ipcKey, data)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(conn, line) //nolint:errcheck
 }
 
 func (s *Server) handleRequest(req Request) Response {
@@ -152,6 +176,52 @@ func (s *Server) handleRequest(req Request) Response {
 	default:
 		return Response{Status: "error", Error: fmt.Sprintf("unknown method: %s", req.Method)}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// AES-256-GCM encryption / decryption
+// Wire format: <nonce_hex>.<ciphertext_hex>
+// ---------------------------------------------------------------------------
+
+func encryptMessage(key [32]byte, plaintext []byte) (string, error) {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(cryptorand.Reader, nonce); err != nil {
+		return "", err
+	}
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+	return hex.EncodeToString(nonce) + "." + hex.EncodeToString(ciphertext), nil
+}
+
+func decryptMessage(key [32]byte, encoded string) ([]byte, error) {
+	parts := strings.SplitN(encoded, ".", 2)
+	if len(parts) != 2 {
+		return nil, errors.New("invalid message format")
+	}
+	nonce, err := hex.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("decode nonce: %w", err)
+	}
+	ciphertext, err := hex.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("decode ciphertext: %w", err)
+	}
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return gcm.Open(nil, nonce, ciphertext, nil)
 }
 
 // ---------------------------------------------------------------------------

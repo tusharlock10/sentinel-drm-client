@@ -188,8 +188,10 @@ func (s *Sentinel) runHardwareBound(ctx context.Context) error {
 		return fmt.Errorf("hardware fingerprint mismatch: this license is not valid for this machine")
 	}
 
-	// Step 3: Launch software. Use the fingerprint as the IPC socket name.
-	ipcSocketPath := ipc.SocketPath(fingerprint)
+	// Step 3: Launch software. Use a random session UUID for the IPC socket path.
+	// The fingerprint is used only for license verification above, not for the socket
+	// name, so the path is not predictable by an attacker who knows the machine hardware.
+	ipcSocketPath := ipc.SocketPath(uuid.New().String())
 	proc, err := process.Launch(s.config.SoftwarePath, []string{
 		"SENTINEL_IPC_SOCKET=" + ipcSocketPath,
 	})

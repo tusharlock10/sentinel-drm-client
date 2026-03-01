@@ -2,7 +2,7 @@
 
 **Status**: Complete
 **Last Updated**: 2026-03-01
-**Phases Complete**: 1, 2, 3, 5, 6, 7, 8
+**Phases Complete**: 1, 2, 3, 5, 6, 7, 8, 9
 **Phases Removed**: 4 (Encrypted State File — client is now stateless)
 
 ---
@@ -500,8 +500,20 @@ func VerifyBinaryChecksum(binaryPath string, expectedChecksum string) error
 
 ### IPC Protocol
 
-JSON-over-newline. Software connects to the socket, sends JSON-line requests, receives
-JSON-line responses.
+AES-256-GCM encrypted, newline-delimited. Every message (request and response) is
+encrypted with a 32-byte shared key (`internal/ipc/ipc_key.go`, gitignored). The
+wire format for each line is:
+
+```
+<nonce_hex>.<ciphertext_hex>\n
+```
+
+- Nonce: 12 random bytes, hex-encoded (new random nonce per message)
+- Ciphertext: AES-256-GCM-encrypted JSON + 16-byte authentication tag, hex-encoded
+
+A connection that sends a line that fails AES-GCM decryption (wrong key or tampered
+message) is dropped immediately with no response. This is how the software verifies it
+is connected to the real sentinel binary — only sentinel knows the shared key.
 
 ```go
 type Request struct {
@@ -533,12 +545,33 @@ type LicenseInfo struct {
 | `"get_features"` | Just the features map |
 | `"health"` | `{"status": "ok"}` |
 
+### IPC Key (`internal/ipc/ipc_key.go`)
+
+A gitignored Go file containing the 32-byte AES-256-GCM key as a `[32]byte` variable.
+Generated once per `(org, software)` build by QNu Labs. The identical key is embedded
+in the consumer software (e.g. `ipc_key.py`) and passed to the Python SDK at runtime.
+
+```go
+// internal/ipc/ipc_key.go  (gitignored)
+package ipc
+var ipcKey = [32]byte{0x01, 0x02, ...}  // 32 bytes; garble obfuscates this at build time
+```
+
+To generate a new key:
+```bash
+python3 -c "import os; key=os.urandom(32); print(', '.join(f'0x{b:02x}' for b in key))"
+```
+
 ### IPC Socket Path
+
+Both license flows (STANDARD and HARDWARE_BOUND) use a **random UUID** for the
+socket path. The fingerprint (HARDWARE_BOUND) is used only for license verification,
+not for the socket name, making the path unpredictable.
 
 | OS | Path |
 |---|---|
-| Linux/macOS | `/tmp/sentinel-<machine_id>.sock` |
-| Windows | `\\.\pipe\sentinel-<machine_id>` |
+| Linux/macOS | `/tmp/sentinel-<session_uuid>.sock` |
+| Windows | `\\.\pipe\sentinel-<session_uuid>` |
 
 ### Server
 
@@ -836,6 +869,19 @@ Phase 8 ✓ Anti-tamper, degradation, and build system
           ├── internal/antitamper/antitamper_other.go   no-op fallback for unsupported platforms
           ├── internal/sentinel/sentinel.go             wired antitamper monitor (both license flows)
           └── Makefile                                  garble builds, cross-compilation (5 platforms)
+
+Phase 9 ✓ IPC authentication (AES-GCM) + Python SDK
+          ├── internal/ipc/ipc_key.go      (gitignored) shared AES-256-GCM key [32]byte
+          ├── internal/ipc/ipc.go          encryptMessage/decryptMessage; handleConnection
+          │                                updated to encrypt all responses and drop connections
+          │                                that fail decryption (unauthenticated clients)
+          ├── internal/ipc/ipc_test.go     TestServerServe updated for encrypted protocol
+          ├── internal/sentinel/sentinel.go runHardwareBound: socket path now uses random UUID
+          │                                (was fingerprint — predictable; now unpredictable)
+          ├── .gitignore                   added internal/ipc/ipc_key.go pattern
+          └── sentinel-drm-python-sdk/     companion Python SDK (separate repo)
+              ├── src/sentinel_sdk/__init__.py  exports sentinel_protect_me_uwu
+              └── src/sentinel_sdk/_sdk.py      AES-GCM IPC client, PPID check, health thread
 ```
 
 ---
@@ -862,3 +908,9 @@ Phase 8 ✓ Anti-tamper, degradation, and build system
 | Anti-tamper macOS | `unix.SysctlKinfoProc` + `info.Proc.P_flag` | High-level wrapper; raw Syscall6 approach had unexported constant names |
 | PEM embedding in ldflags | File path + awk newline escaping + runtime unescape | `-ldflags -X` cannot handle multiline strings; awk converts `\n` → `\n` literal |
 | Go version pinned | go 1.25.0 + toolchain go1.25.7 | garble v0.15.0 requires Go ≤ 1.25; toolchain directive prevents silent upgrades |
+| IPC authentication | AES-256-GCM shared key (gitignored `ipc_key.go`) | No key embedding in binary at build time from external tooling; key baked in directly; garble obfuscates it; equivalent security to challenge-response with embedded key |
+| IPC wire format | `<nonce_hex>.<ciphertext_hex>\n` | Hex chosen over base64 — no padding edge cases; symmetric with Python's `bytes.fromhex` |
+| Unauthenticated IPC connections | Drop connection silently (no error response) | Sending an encrypted error would confirm the socket exists and is sentinel |
+| HARDWARE_BOUND socket path | Random UUID (was fingerprint) | Hardware fingerprint is deterministic and pre-computable; random UUID prevents socket path prediction |
+| Software PPID check | Checked every 30s in Python SDK health thread | Detects sentinel being killed and software being re-parented to init/launchd |
+| Background thread hard exit | `os._exit(1)` not `sys.exit()` | `SystemExit` from non-main threads does not terminate the process in Python |

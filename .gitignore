@@ -37,3 +37,6 @@ build/
 
 # Ignore any PEM files
 *.pem
+
+# IPC shared AES-GCM key — generated per org/software build, never committed
+internal/ipc/ipc_key.go
