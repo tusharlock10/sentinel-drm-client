@@ -1,8 +1,9 @@
 # Sentinel DRM Client — Detailed Implementation Plan
 
 **Status**: Complete
-**Last Updated**: 2026-02-28
-**Phases Complete**: 1, 2, 3, 4, 5, 6, 7, 8
+**Last Updated**: 2026-03-01
+**Phases Complete**: 1, 2, 3, 5, 6, 7, 8
+**Phases Removed**: 4 (Encrypted State File — client is now stateless)
 
 ---
 
@@ -12,9 +13,8 @@
 2. [Architecture](#2-architecture)
 3. [Phase 1 — Project Skeleton, CLI, Crypto Primitives](#3-phase-1--project-skeleton-cli-crypto-primitives)
 4. [Phase 2 — License File Parsing and Verification](#4-phase-2--license-file-parsing-and-verification)
-5. [Phase 3 — Hardware Fingerprint and OS Keystore](#5-phase-3--hardware-fingerprint-and-os-keystore)
-6. [Phase 4 — Encrypted State File](#6-phase-4--encrypted-state-file)
-7. [Phase 5 — DRM Server Communication](#7-phase-5--drm-server-communication)
+5. [Phase 3 — Hardware Fingerprint](#5-phase-3--hardware-fingerprint)
+6. [Phase 5 — DRM Server Communication](#7-phase-5--drm-server-communication)
 8. [Phase 6 — Process Management and IPC](#8-phase-6--process-management-and-ipc)
 9. [Phase 7 — Main Orchestrator](#9-phase-7--main-orchestrator)
 10. [Phase 8 — Anti-Tamper, Degradation, and Build System](#10-phase-8--anti-tamper-degradation-and-build-system)
@@ -33,8 +33,8 @@ embedded at compile time via `-ldflags`. The client:
 
 - Validates license files offline (signature verification with embedded public key)
 - Launches licensed software as a child process
-- Communicates with the Sentinel DRM backend for activation and periodic heartbeats
-  (STANDARD licenses)
+- Communicates with the Sentinel DRM backend for registration and periodic heartbeats
+  (STANDARD licenses); the client is stateless — no state is persisted between runs
 - Validates hardware fingerprints locally (HARDWARE_BOUND licenses, fully air-gapped)
 - Provides license metadata to the running software over IPC
 - Protects against debugging, patching, and tampering
@@ -70,15 +70,11 @@ sentinel-drm-client/
 │   │   └── crypto.go
 │   ├── license/                   # License file parsing, payload validation, signature verification
 │   │   └── license.go
-│   ├── hardware/                  # Hardware fingerprint collection
-│   │   ├── hardware.go            # Interface + fingerprint computation
+│   ├── hardware/                  # Hardware fingerprint collection (HARDWARE_BOUND only)
+│   │   ├── hardware.go            # CollectFingerprint()
 │   │   ├── hardware_linux.go
 │   │   ├── hardware_darwin.go
 │   │   └── hardware_windows.go
-│   ├── keystore/                  # File-based AES-256-GCM keystore
-│   │   └── keystore.go            # Vault key passed in by caller (derived in Phase 7)
-│   ├── state/                     # Encrypted local state file management
-│   │   └── state.go
 │   ├── drm/                       # DRM server communication
 │   │   └── drm.go
 │   ├── process/                   # Software process lifecycle management
@@ -104,22 +100,22 @@ sentinel-drm-client/
 ```
 Phase 1: config, crypto               (no deps)
 Phase 2: license                       (depends on: crypto)
-Phase 3: keystore, hardware            (no deps)
-Phase 4: state                         (depends on: keystore)
-Phase 5: drm                           (depends on: crypto, state)
+Phase 3: hardware                      (no deps — HARDWARE_BOUND fingerprint only)
+Phase 5: drm                           (depends on: crypto)
 Phase 6: process, ipc                  (no deps)
 Phase 7: sentinel orchestrator         (depends on: ALL above)
 Phase 8: antitamper, Makefile          (depends on: ipc, sentinel)
 ```
+Note: Phase 4 (Encrypted State File) was removed. The client is stateless — no
+keystore, no machine EC keypair, no activation state is persisted between runs.
 
 ### Startup Flows
 
 **STANDARD license:**
-1. Parse CLI flags → 2. Load/verify license file → 3. Init keystore →
-4. Load/generate machine EC keypair → 5. Load/create state file →
-6. Contact server: activate or heartbeat → 7. Verify response signature →
-8. Verify software binary checksum → 9. Launch software → 10. Start IPC server →
-11. Start heartbeat loop → 12. Start anti-tamper monitoring → 13. Monitor process
+1. Parse CLI flags → 2. Load/verify license file → 3. Register with DRM server →
+4. Verify signed response; if status is not ACTIVE, exit with error →
+5. Verify software binary checksum → 6. Launch software → 7. Start IPC server →
+8. Start heartbeat loop → 9. Start anti-tamper monitoring → 10. Monitor process
 
 **HARDWARE_BOUND license:**
 1. Parse CLI flags → 2. Load/verify license file → 3. Collect hardware fingerprint →
@@ -290,11 +286,11 @@ type LicensePayload struct {
 
 ---
 
-## 5. Phase 3 — Hardware Fingerprint and File-Based Keystore ✓
+## 5. Phase 3 — Hardware Fingerprint ✓
 
-### Files (Hardware)
+### Files
 
-- `internal/hardware/hardware.go` — `CollectFingerprint()` + `GetMachineID()` + SHA-256
+- `internal/hardware/hardware.go` — `CollectFingerprint()` + SHA-256
 - `internal/hardware/hardware_linux.go`
 - `internal/hardware/hardware_darwin.go`
 - `internal/hardware/hardware_windows.go`
@@ -303,11 +299,10 @@ type LicensePayload struct {
 
 ```go
 func CollectFingerprint() (string, error)
-func GetMachineID() (string, error)
 ```
 
 `CollectFingerprint` returns `SHA256Hex(cpuSerial + diskSerial + machineID)`.
-`GetMachineID` exposes the platform machine ID for keystore vault key derivation in Phase 7.
+Used only for HARDWARE_BOUND license verification. Not used for STANDARD licenses.
 
 **Platform-specific collection:**
 
@@ -323,91 +318,8 @@ Windows uses `powershell.exe -NoProfile -NonInteractive -Command` for all querie
 Each platform function must return clear errors if a component cannot be read.
 No fallbacks — fail fast if hardware identity cannot be established.
 
-### Files (Keystore)
-
-- `internal/keystore/keystore.go`
-
-### Keystore API
-
-```go
-var ErrNotFound = errors.New("key not found")
-
-const (
-    KeyMachinePrivateKey  = "machine-private-key"
-    KeyStateEncryptionKey = "state-encryption-key"
-)
-
-type Keystore interface {
-    Store(key string, data []byte) error
-    Retrieve(key string) ([]byte, error)
-    Delete(key string) error
-}
-
-func New(filePath string, vaultKey [32]byte) (Keystore, error)
-func DefaultFilePath() (string, error)
-func DeriveVaultKey(machineID string) [32]byte
-```
-
-File-based AES-256-GCM encrypted keystore. No external dependency.
-Each entry stored as `base64(nonce[12] || ciphertext)` in a JSON file.
-Writes are atomic (`<path>.tmp` → `os.Rename`). File permissions: `0600`.
-
-`DeriveVaultKey` computes `SHA256("sentinel-drm-keystore:" + machineID)`, tying
-the keystore file to the machine. In Phase 7 the orchestrator calls:
-`keystore.New(path, keystore.DeriveVaultKey(hardware.GetMachineID()))`.
-
-Stored items:
-- `KeyMachinePrivateKey` — EC P-256 private key (PEM-encoded)
-- `KeyStateEncryptionKey` — 32 bytes for AES-256-GCM state file encryption
-
 ---
 
-## 6. Phase 4 — Encrypted State File
-
-### Files
-
-- `internal/state/state.go`
-
-### State File Location
-
-| OS | Path |
-|---|---|
-| Linux | `$XDG_DATA_HOME/sentinel-drm/state.enc` (default `~/.local/share/sentinel-drm/state.enc`) |
-| macOS | `~/Library/Application Support/sentinel-drm/state.enc` |
-| Windows | `%APPDATA%\sentinel-drm\state.enc` |
-
-### State Structure
-
-```go
-type State struct {
-    MachineID             string `json:"machine_id"`              // UUID v4, generated once
-    Activated             bool   `json:"activated"`               // activation succeeded
-    LicenseKey            string `json:"license_key"`             // from license file
-    LastHeartbeatSuccess  int64  `json:"last_heartbeat_success"`  // unix timestamp
-    GraceRemainingSeconds int64  `json:"grace_remaining_seconds"` // total grace quota left
-    GraceExhausted        bool   `json:"grace_exhausted"`         // no more grace ever
-}
-```
-
-### Encryption
-
-- Key: 32 bytes, stored in OS keystore. Generated with `crypto/rand` on first run.
-- Algorithm: AES-256-GCM
-- On-disk format: `nonce(12 bytes) || ciphertext`
-- Atomic writes: write to temp file, then `os.Rename`
-
-### Functions
-
-```go
-type StateManager struct { ... }
-
-func NewStateManager(ks keystore.Keystore) (*StateManager, error)
-func (sm *StateManager) Load() (*State, error)   // nil if first run
-func (sm *StateManager) Save(state *State) error
-func (sm *StateManager) Delete() error           // removes state file; used on decommission
-```
-
----
 
 ## 7. Phase 5 — DRM Server Communication
 
@@ -415,112 +327,77 @@ func (sm *StateManager) Delete() error           // removes state file; used on 
 
 - `internal/drm/drm.go`
 
-### Request Signing Protocol
+### Security Model
 
-Every request to `/api/v1/drm/` carries these headers:
-
-```
-X-Sentinel-Machine-Id:  <machine_id>
-X-Sentinel-Timestamp:   <unix epoch seconds, integer string>
-X-Sentinel-Nonce:       <UUID v4 string>
-X-Sentinel-Signature:   <base64url(DER-encoded ECDSA-SHA256 signature)>
-```
-
-**Signing string** (must match backend exactly):
-
-```
-{HTTP_METHOD}\n{PATH}\n{TIMESTAMP}\n{NONCE}\n{SHA256_HEX(BODY)}
-```
-
-Example:
-```
-POST
-/api/v1/drm/activate/
-1708869000
-f47ac10b-58cc-4372-a567-0e02b2c3d479
-a3f5c9e1d2b3f4a5e6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8
-```
-
-The signature is `ECDSA-SHA256(utf-8 bytes of signing string, machine_private_key)`.
+The client does **not** sign requests. The server is the source of truth and HTTPS
+is the transport security layer. The client verifies every server **response** using
+the org's EC public key embedded in the binary — this prevents a MITM from forging
+or replaying responses (e.g., injecting a fake `REVOKED` to DoS, or suppressing a
+real `REVOKED` to keep a dead license running).
 
 ### Response Verification
 
-Every response from the backend:
+Every response from the backend is a signed envelope:
 
 ```json
-{"payload": "<base64url>", "sig": "<base64url>"}
+{"payload": "<base64url(canonical_json)>", "sig": "<base64url(ecdsa_sig)>"}
 ```
 
-Verification: `crypto.VerifyECDSA(orgPubKey, []byte(response.Payload), sigBytes)`
-— signature is over the base64url string, not the decoded JSON.
+Verification: `crypto.VerifyECDSA(orgPubKey, []byte(envelope.Payload), sigBytes)`
+— signature is over the raw base64url payload string, not the decoded JSON.
 
-The `request_nonce` in the decoded response payload MUST match the nonce sent in the
-request header. This prevents response replay attacks.
+The `request_nonce` in the decoded response payload MUST match the nonce sent in
+`X-Sentinel-Nonce`. This binds the response to the specific request and prevents
+replay of old signed responses.
 
 ### Endpoints
 
-#### POST `/api/v1/drm/activate/`
+#### POST `/api/v1/drm/register/`
 
-Called by STANDARD license software at first startup.
+Called once at startup for STANDARD licenses. Creates an ephemeral `LicenseMachine`
+record on the server and returns a session token held in memory for the process lifetime.
+
+**Request headers:** `Content-Type: application/json`, `X-Sentinel-Nonce: <uuid>`
 
 **Request body:**
 ```json
 {
   "license_key": "SENTINEL-XXXX-XXXX-XXXX-XXXX",
-  "machine_id": "<client-generated UUID>",
-  "machine_public_key_pem": "<EC P-256 public key, PEM>",
   "platform": "LINUX_AMD64",
   "software_version": "2.1.4"
 }
 ```
 
-**Response payload:**
+**Response payload (always a signed 200):**
 ```json
 {
   "status": "ACTIVE",
-  "machine_id": "...",
-  "license_key": "SENTINEL-...",
-  "expiry_date": "2026-01-01",
-  "heartbeat_interval_minutes": 15,
-  "heartbeat_grace_period_days": 3,
-  "features": {"max_users": 500},
-  "request_nonce": "<reflected>",
-  "responded_at": "2025-06-01T10:00:00Z"
+  "token": "<uuid — LicenseMachine.token, or null if not ACTIVE>",
+  "request_nonce": "<reflected>"
 }
 ```
 
-Re-activation (same machine_id): idempotent, updates public key if changed.
+- `status` reflects the current license status. If anything other than `ACTIVE`,
+  `token` is null and the sentinel client logs the status and exits immediately.
+- `404` is returned for licenses not found or that are not STANDARD type.
+- Max-machines enforcement does **not** happen at registration; it happens at the
+  first heartbeat. A new machine gets up to one full heartbeat interval to begin
+  heartbeating before enforcement fires.
 
-**Error responses (400):**
-- "License not found."
-- "Only STANDARD licenses support activation."
-- "License is DRAFT|REVOKED|SUSPENDED|EXPIRED."
-- "License has expired."
-- "Maximum machine limit reached for this license."
+#### GET `/api/v1/drm/heartbeat/`
 
-#### POST `/api/v1/drm/heartbeat/`
+Called periodically by STANDARD license software at `heartbeat_interval_minutes`
+interval. Any failure (network or server error) causes immediate shutdown.
 
-Called periodically by STANDARD license software.
+**Request headers:** `X-Sentinel-Token: <token>`, `X-Sentinel-Nonce: <uuid>`
 
-**Request body:**
-```json
-{
-  "license_key": "SENTINEL-XXXX-XXXX-XXXX-XXXX",
-  "machine_id": "<UUID>",
-  "software_version": "2.1.4"
-}
-```
+**No request body.**
 
-**Response payload:**
+**Response payload (signed):**
 ```json
 {
   "status": "ACTIVE",
-  "machine_id": "...",
-  "license_key": "...",
-  "expiry_date": "2026-01-01",
-  "decommission_pending": false,
-  "request_nonce": "<reflected>",
-  "responded_at": "2025-06-01T10:00:00Z"
+  "request_nonce": "<reflected>"
 }
 ```
 
@@ -529,33 +406,10 @@ Called periodically by STANDARD license software.
 | Status | Action |
 |---|---|
 | `ACTIVE` | Continue normal operation |
-| `REVOKED` | Stop immediately; surface error to user |
-| `EXPIRED` | Stop immediately; surface expiry message |
-| `SUSPENDED` | Stop; display "license suspended — contact vendor" |
-| `DECOMMISSION_PENDING` | Finish work; call `/drm/decommission-ack/`; shut down |
-
-#### POST `/api/v1/drm/decommission-ack/`
-
-Called after receiving `decommission_pending: true`.
-
-**Request body:**
-```json
-{
-  "license_key": "...",
-  "machine_id": "..."
-}
-```
-
-**Response payload:**
-```json
-{
-  "status": "DECOMMISSIONED",
-  "machine_id": "...",
-  "license_key": "...",
-  "request_nonce": "<reflected>",
-  "responded_at": "..."
-}
-```
+| `REVOKED` | Log status and shut down immediately |
+| `EXPIRED` | Log status and shut down immediately |
+| `SUSPENDED` | Log status and shut down immediately |
+| `DECOMMISSIONED` | Log status and shut down immediately |
 
 ### Platform String Detection
 
@@ -574,16 +428,30 @@ Detected at runtime using `runtime.GOOS` and `runtime.GOARCH`:
 ```go
 type Client struct {
     serverURL  string
-    machineID  string
-    machineKey *ecdsa.PrivateKey
     orgPubKey  *ecdsa.PublicKey
     httpClient *http.Client
 }
 
-func NewClient(serverURL, machineID string, machineKey *ecdsa.PrivateKey, orgPubKey *ecdsa.PublicKey) *Client
-func (c *Client) Activate(req ActivateRequest) (*ActivateResponse, error)
-func (c *Client) Heartbeat(req HeartbeatRequest) (*HeartbeatResponse, error)
-func (c *Client) DecommissionAck(req DecommissionAckRequest) (*DecommissionAckResponse, error)
+type RegisterRequest struct {
+    LicenseKey      string `json:"license_key"`
+    Platform        string `json:"platform"`
+    SoftwareVersion string `json:"software_version"`
+}
+
+type RegisterResponse struct {
+    Status       string `json:"status"`
+    Token        string `json:"token"`
+    RequestNonce string `json:"request_nonce"`
+}
+
+type HeartbeatResponse struct {
+    Status       string `json:"status"`
+    RequestNonce string `json:"request_nonce"`
+}
+
+func NewClient(serverURL string, orgPubKey *ecdsa.PublicKey) *Client
+func (c *Client) Register(req RegisterRequest) (*RegisterResponse, error)
+func (c *Client) Heartbeat(token string) (*HeartbeatResponse, error)
 ```
 
 ---
@@ -701,8 +569,6 @@ type Sentinel struct {
     config    *config.Config
     orgPubKey *ecdsa.PublicKey
     license   *license.LicensePayload
-    stateMgr  *state.StateManager
-    drmClient *drm.Client
     process   *process.Manager
     ipcServer *ipc.Server
 }
@@ -718,68 +584,37 @@ func SetupSignalHandler() (context.Context, context.CancelFunc)
 ### STANDARD License Flow
 
 1. Load and verify license file (signature + expiry)
-2. Initialize keystore (vault key = `keystore.DeriveVaultKey(hardware.GetMachineID())`)
-3. Load or generate machine EC keypair from keystore; PEM bytes wrapped in
-   `memguard.LockedBuffer` when loaded from keystore
-4. Load state file. If first run, generate machine ID (UUID v4), create initial state
-5. **License key change detection**: if `state.LicenseKey != license.LicenseKey`, reset
-   activation, grace quota, and `GraceExhausted`
-6. Create DRM client using `*license.ServerURL` (server URL is embedded in license file,
-   not a CLI flag)
-7. **Activation**: If `state.Activated == false`, call `drm.Activate()`. On success,
-   set `state.Activated = true`, save state
-8. **Mandatory startup heartbeat**: Call `drm.Heartbeat()`.
-   - If server unreachable (connection error):
-     - If `grace_remaining_seconds > 0` and `!grace_exhausted`: allow startup,
-       log warning — grace will be consumed by heartbeat loop
-     - If `grace_exhausted == true` or `grace_remaining_seconds <= 0`: refuse to start
-   - If server responds with non-ACTIVE status:
-     - `DECOMMISSION_PENDING`: call `drm.DecommissionAck()`, delete state, exit
-     - `REVOKED`, `EXPIRED`, `SUSPENDED`: exit with appropriate error message
-9. Launch software process; pass `SENTINEL_IPC_SOCKET` env var
-10. Start IPC server in a goroutine
-11. Start heartbeat loop in a goroutine
-12. Start anti-tamper monitoring (Phase 8)
-13. Wait for: software exit OR fatal heartbeat failure OR signal
+2. Create DRM client using `*license.ServerURL` (embedded in license file, not a CLI flag)
+3. Call `drm.Register()`. Verify signed response. If `status != "ACTIVE"`, log status
+   and exit immediately. On success, hold `token` in memory for this process lifetime.
+4. Generate a session UUID for the IPC socket path (local-only, not sent to server)
+5. Launch software process; pass `SENTINEL_IPC_SOCKET` env var
+6. Start IPC server in a goroutine
+7. Start heartbeat loop in a goroutine
+8. Start anti-tamper monitoring (Phase 8)
+9. Wait for: software exit OR heartbeat failure OR signal
 
 ### HARDWARE_BOUND License Flow
 
 1. Load and verify license file (signature + expiry)
 2. Collect hardware fingerprint
 3. Compare with `license.HardwareFingerprint` — must match exactly
-4. Launch software process; use fingerprint as machine ID for IPC socket naming
+4. Launch software process; use fingerprint as IPC socket name
 5. Start IPC server
 6. Start anti-tamper monitoring (Phase 8)
-7. Wait for software exit or signal
-8. No heartbeat loop, no server communication, no state file — fully offline
+7. Wait for software exit or signal — fully offline, no server communication
 
 ### Heartbeat Loop
 
 ```go
-func (s *Sentinel) heartbeatLoop(ctx context.Context, st *state.State,
-    stateMgr *state.StateManager, drmClient *drm.Client)
+func (s *Sentinel) heartbeatLoop(ctx context.Context, token string, drmClient *drm.Client)
 ```
 
-- Runs on a `time.Ticker` at `heartbeat_interval_minutes`
-- **Connection error**: calls `consumeGrace` (package-level). If `isGraceExhausted`
-  (package-level) → calls `s.process.Stop()` and returns
-- **Server error** (non-connection): logs and continues — does NOT consume grace
-- **Successful heartbeat**: updates `LastHeartbeatSuccess`, saves state, calls
-  `processHeartbeatResponse`
-- **`processHeartbeatResponse` returns error** → calls `s.process.Stop()` and returns
-
-### Grace Period Logic
-
-- **Total grace quota**: `heartbeat_grace_period_days * 24 * 60 * 60` seconds
-  (e.g., 3 days = 259,200 seconds)
-- **Each missed heartbeat (connection error only)** consumes `heartbeat_interval_minutes * 60` seconds
-- **Server errors** (HTTP 4xx/5xx): do NOT consume grace — retry next interval
-- **On successful heartbeat**: grace stops being consumed; remaining quota is
-  preserved (NOT reset to full)
-- **After full exhaustion** (`grace_exhausted = true`): software works if server
-  is reachable, but next single connection miss = immediate shutdown (no grace left)
-- **Startup always contacts server** (STANDARD licenses): prevents restart cycling
-  to abuse grace period
+- Runs on a `time.Ticker` at `heartbeat_interval_minutes` from the license file
+- **Any error** (connection failure or server error): log error and immediately call
+  `s.process.Stop()` and return. There is no grace period or retry.
+- **`status != "ACTIVE"`**: log the status and immediately call `s.process.Stop()` and return
+- **`status == "ACTIVE"`**: continue to next tick
 
 ### Signal Handling
 
@@ -788,11 +623,8 @@ a cancellable context that is passed into `Run()`.
 
 On SIGINT/SIGTERM:
 1. Context is cancelled → heartbeat loop returns, IPC Serve returns
-2. Main select picks up `ctx.Done()` → calls `cleanup()` (saves state, closes IPC)
-3. Calls `proc.Stop()` (SIGTERM → 10s → SIGKILL)
-4. Sentinel exits
-
-`cleanup(st, stateMgr)` does not take a context parameter (it is unused).
+2. Main select picks up `ctx.Done()` → closes IPC server, calls `proc.Stop()`
+3. Sentinel exits
 
 ---
 
@@ -918,9 +750,8 @@ External Go dependencies:
 | Dependency | Purpose | Added |
 |---|---|---|
 | `github.com/spf13/cobra` | CLI framework — single root command with flags | Phase 1 |
-| `github.com/google/uuid` | UUID v4 nonce generation in DRM request signing | Phase 5 |
+| `github.com/google/uuid` | UUID v4 generation for request nonces and IPC session IDs | Phase 5 |
 | `github.com/Microsoft/go-winio` | Windows named pipe IPC (`\\.\pipe\...`); build-tagged Windows-only | Phase 6 |
-| `github.com/awnumar/memguard` | Secure memory for private keys — prevents key material swapping to disk | Phase 7 |
 | `mvdan.cc/garble` | Binary obfuscation (build tool only, not a library dependency) | Phase 8 |
 
 Everything else uses Go stdlib: `crypto/ecdsa`, `crypto/elliptic`, `crypto/sha256`,
@@ -963,21 +794,19 @@ Phase 2 ✓ License file parsing and verification
           ├── internal/license/license.go      parse .lic, verify sig, extract payload
           └── internal/license/license_test.go 16 tests, all passing
 
-Phase 3 ✓ Hardware fingerprint and file-based keystore
-          ├── internal/hardware/hardware.go         CollectFingerprint(), GetMachineID()
+Phase 3 ✓ Hardware fingerprint (HARDWARE_BOUND only)
+          ├── internal/hardware/hardware.go         CollectFingerprint()
           ├── internal/hardware/hardware_linux.go   DMI UUID / cpuinfo, findmnt+sysfs, machine-id
           ├── internal/hardware/hardware_darwin.go  ioreg, diskutil, ioreg UUID
-          ├── internal/hardware/hardware_windows.go PowerShell Get-CimInstance, registry
-          └── internal/keystore/keystore.go         New(filePath, vaultKey), DeriveVaultKey(),
-                                                    DefaultFilePath(), ErrNotFound
+          └── internal/hardware/hardware_windows.go PowerShell Get-CimInstance, registry
+          Note: keystore package removed (client is stateless)
 
-Phase 4 ✓ Encrypted state file
-          ├── internal/state/state.go      AES-256-GCM encrypted local state
-          └── internal/state/state_test.go 11 tests, all passing
+Phase 4   REMOVED — Encrypted State File
+          The client is stateless. No machine EC keypair, no activation state,
+          no grace period is persisted between process runs.
 
 Phase 5 ✓ DRM server communication
-          ├── internal/drm/drm.go          activate, heartbeat, decommission-ack
-          │                                with request signing + response verification
+          ├── internal/drm/drm.go          register + heartbeat with response verification
           └── internal/drm/drm_test.go     12 tests, all passing (httptest mock backend)
 
 Phase 6 ✓ Process management and IPC
@@ -994,7 +823,8 @@ Phase 6 ✓ Process management and IPC
 
 Phase 7 ✓ Main orchestrator
           ├── internal/sentinel/sentinel.go  STANDARD + HARDWARE_BOUND flows,
-          │                                  heartbeat loop, grace period, signal handling
+          │                                  heartbeat loop (any failure = immediate shutdown),
+          │                                  signal handling
           ├── internal/config/config.go      added Version field (threaded from main ldflags var)
           └── cmd/sentinel/main.go           wired: SetupSignalHandler(), sentinel.New(), Run()
 
@@ -1019,11 +849,13 @@ Phase 8 ✓ Anti-tamper, degradation, and build system
 | Hardware fingerprint | SHA-256(CPU serial + disk serial + machine ID) | Reasonably stable, covers key hardware identifiers |
 | Clock tampering | Skipped in v1 | Cannot reliably prevent at software level; revisit with TPM |
 | Anti-tamper response | Service degradation | Harder for crackers to identify protection trigger vs immediate kill |
-| Grace period | 3-day total quota, server as source of truth | Prevents abuse while allowing legitimate offline operation |
+| Client statefulness | Stateless — no keystore, no state file, no machine EC keypair | Simplifies client; server is the sole source of truth |
+| Heartbeat failure | Any failure = immediate shutdown, no grace period | Customer accepts risk of network interruption; simpler and harder to abuse |
+| Max-machines enforcement | Enforced server-side at first heartbeat, not at registration | Allows legitimate restarts without waiting for a slot to free up |
+| Session token | UUID generated by server per registration, held in memory | Simple; no key material on disk; lost on process exit which is correct |
+| Request authentication | No client-side request signing; HTTPS only | Server signs all responses; response forgery/replay protection still exists |
 | Process management | Direct exec with monitoring | Simple, reliable, sentinel exits when software exits |
 | Binary verification | SHA-256 from license payload | Prevents patched binaries (pending backend field) |
-| State encryption key | OS keystore | Most secure, platform-native credential storage |
-| Machine keypair storage | OS keystore | Private key never on disk in plaintext |
 | Canonical JSON | Sorted keys, compact, ASCII-only | Must be byte-identical with Python backend output |
 | Obfuscation | garble with -literals -tiny | Hides string literals and embedded keys in binary |
 | Anti-tamper Linux | TracerPid only (no ptrace self-check) | ptrace PTRACE_TRACEME is unsafe in Go's multithreaded runtime |

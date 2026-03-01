@@ -155,13 +155,9 @@ type RegisterRequest struct {
 }
 
 type RegisterResponse struct {
-	Token                    string         `json:"token"`
-	LicenseKey               string         `json:"license_key"`
-	ExpiryDate               string         `json:"expiry_date"`
-	HeartbeatIntervalMinutes int            `json:"heartbeat_interval_minutes"`
-	Features                 map[string]any `json:"features"`
-	RequestNonce             string         `json:"request_nonce"`
-	RespondedAt              string         `json:"responded_at"`
+	Status       string `json:"status"`
+	Token        string `json:"token"`
+	RequestNonce string `json:"request_nonce"`
 }
 
 // Register creates a new ephemeral machine registration and returns a session token.
@@ -199,10 +195,7 @@ func (c *Client) Register(req RegisterRequest) (*RegisterResponse, error) {
 
 type HeartbeatResponse struct {
 	Status       string `json:"status"`
-	LicenseKey   string `json:"license_key"`
-	ExpiryDate   string `json:"expiry_date"`
 	RequestNonce string `json:"request_nonce"`
-	RespondedAt  string `json:"responded_at"`
 }
 
 // Heartbeat sends a periodic check-in to the DRM backend.

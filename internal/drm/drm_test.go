@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/tusharlock10/sentinel-drm-client/internal/crypto"
 )
@@ -73,23 +72,16 @@ func signMockResponse(t *testing.T, payload map[string]any, orgPrivKey *ecdsa.Pr
 
 func registerPayload(nonce string) map[string]any {
 	return map[string]any{
-		"token":                      "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-		"license_key":                "SENTINEL-TEST-0001",
-		"expiry_date":                "2027-01-01",
-		"heartbeat_interval_minutes": 15,
-		"features":                   map[string]any{"max_users": float64(500)},
-		"request_nonce":              nonce,
-		"responded_at":               time.Now().UTC().Format(time.RFC3339),
+		"status":        "ACTIVE",
+		"token":         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		"request_nonce": nonce,
 	}
 }
 
 func heartbeatPayload(nonce string) map[string]any {
 	return map[string]any{
 		"status":        "ACTIVE",
-		"license_key":   "SENTINEL-TEST-0001",
-		"expiry_date":   "2027-01-01",
 		"request_nonce": nonce,
-		"responded_at":  time.Now().UTC().Format(time.RFC3339),
 	}
 }
 
@@ -112,14 +104,11 @@ func TestRegister_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
+	if resp.Status != "ACTIVE" {
+		t.Errorf("expected ACTIVE status, got %s", resp.Status)
+	}
 	if resp.Token == "" {
 		t.Error("expected non-empty token")
-	}
-	if resp.HeartbeatIntervalMinutes != 15 {
-		t.Errorf("expected heartbeat_interval_minutes 15, got %d", resp.HeartbeatIntervalMinutes)
-	}
-	if resp.LicenseKey != "SENTINEL-TEST-0001" {
-		t.Errorf("license_key mismatch: %s", resp.LicenseKey)
 	}
 }
 

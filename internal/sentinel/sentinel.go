@@ -86,25 +86,18 @@ func (s *Sentinel) runStandard(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
+	if regResp.Status != "ACTIVE" {
+		return fmt.Errorf("license is not active (status: %s) — shutting down", regResp.Status)
+	}
 	token := regResp.Token
 	log.Printf("Registered with DRM server (token: %s...)", token[:8])
 
-	// Step 2: Mandatory startup heartbeat — confirms the server accepted this
-	// machine and that max_machines enforcement allows it to run.
-	hbResp, err := drmClient.Heartbeat(token)
-	if err != nil {
-		return fmt.Errorf("startup heartbeat failed: %w", err)
-	}
-	if hbResp.Status != "ACTIVE" {
-		return fmt.Errorf("startup heartbeat rejected (status: %s)", hbResp.Status)
-	}
-
-	// Step 3: Generate a session UUID for the IPC socket path.
+	// Step 2: Generate a session UUID for the IPC socket path.
 	// This is local-only and is not sent to the server.
 	sessionID := uuid.New().String()
 	ipcSocketPath := ipc.SocketPath(sessionID)
 
-	// Step 4: Launch software.
+	// Step 3: Launch software.
 	proc, err := process.Launch(s.config.SoftwarePath, []string{
 		"SENTINEL_IPC_SOCKET=" + ipcSocketPath,
 	})
@@ -113,7 +106,7 @@ func (s *Sentinel) runStandard(ctx context.Context) error {
 	}
 	s.process = proc
 
-	// Step 5: Start IPC server.
+	// Step 4: Start IPC server.
 	licenseInfo := &ipc.LicenseInfo{
 		LicenseKey:  s.license.LicenseKey,
 		LicenseType: string(s.license.LicenseType),
@@ -131,13 +124,13 @@ func (s *Sentinel) runStandard(ctx context.Context) error {
 
 	go ipcSrv.Serve(ctx) //nolint:errcheck
 
-	// Step 6: Start anti-tamper monitor.
+	// Step 5: Start anti-tamper monitor.
 	go antitamper.NewMonitor(ipcSrv).Start(ctx)
 
-	// Step 7: Start heartbeat loop.
+	// Step 6: Start heartbeat loop.
 	go s.heartbeatLoop(ctx, token, drmClient)
 
-	// Step 8: Wait for software exit or shutdown signal.
+	// Step 7: Wait for software exit or shutdown signal.
 	select {
 	case <-proc.Exited():
 		_ = ipcSrv.Close()
@@ -165,18 +158,13 @@ func (s *Sentinel) heartbeatLoop(ctx context.Context, token string, drmClient *d
 		case <-ticker.C:
 			resp, err := drmClient.Heartbeat(token)
 			if err != nil {
-				if drm.IsConnectionError(err) {
-					log.Printf("Heartbeat connection error: %v — will retry next interval", err)
-				} else {
-					log.Printf("Heartbeat server error: %v — shutting down", err)
-					_ = s.process.Stop()
-					return
-				}
-				continue
+				log.Printf("Heartbeat failed: %v — shutting down", err)
+				_ = s.process.Stop()
+				return
 			}
 
 			if resp.Status != "ACTIVE" {
-				log.Printf("Heartbeat status %q — shutting down", resp.Status)
+				log.Printf("License is not active (status: %s) — shutting down", resp.Status)
 				_ = s.process.Stop()
 				return
 			}
