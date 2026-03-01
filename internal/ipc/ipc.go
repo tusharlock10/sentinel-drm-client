@@ -13,6 +13,8 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -63,12 +65,23 @@ type Server struct {
 	mu           sync.Mutex
 }
 
-// SocketPath returns the platform-appropriate IPC socket path for the given machine ID.
+// SocketPath returns the IPC Unix socket path for the given machine ID.
+// AF_UNIX sockets are used on all platforms (Linux, macOS, Windows 10+).
+// On Windows the socket file is placed in the OS temp directory.
 func SocketPath(machineID string) string {
 	if runtime.GOOS == "windows" {
-		return `\\.\pipe\sentinel-` + machineID
+		return filepath.Join(os.TempDir(), "sentinel-"+machineID+".sock")
 	}
 	return "/tmp/sentinel-" + machineID + ".sock"
+}
+
+func newListener(socketPath string) (net.Listener, error) {
+	os.Remove(socketPath) // remove stale socket file from a previous run
+	return net.Listen("unix", socketPath)
+}
+
+func cleanupListener(socketPath string) {
+	os.Remove(socketPath)
 }
 
 // NewServer creates the IPC listener and returns a Server ready to call Serve on.

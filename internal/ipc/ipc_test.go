@@ -4,10 +4,15 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"net"
 	"strings"
 	"testing"
 	"time"
 )
+
+func dialSocket(socketPath string) (net.Conn, error) {
+	return net.Dial("unix", socketPath)
+}
 
 // testLicenseInfo returns a sample LicenseInfo for use in tests.
 func testLicenseInfo() *LicenseInfo {

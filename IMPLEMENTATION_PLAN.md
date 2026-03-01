@@ -494,9 +494,9 @@ func VerifyBinaryChecksum(binaryPath string, expectedChecksum string) error
 
 ### Files (IPC)
 
-- `internal/ipc/ipc.go` — protocol types, Server, Serve, SocketPath helper, degradation stubs
-- `internal/ipc/ipc_unix.go` — Unix domain socket listener (Linux/macOS)
-- `internal/ipc/ipc_windows.go` — Named pipe listener via `github.com/Microsoft/go-winio` (Windows)
+- `internal/ipc/ipc.go` — protocol types, Server, Serve, SocketPath, newListener/cleanupListener, AES-GCM encrypt/decrypt, degradation stubs
+- `internal/ipc/ipc_unix.go` — excluded (`//go:build ignore`); replaced by inline listener in ipc.go
+- `internal/ipc/ipc_windows.go` — excluded (`//go:build ignore`); named pipes removed, AF_UNIX used on all platforms
 
 ### IPC Protocol
 
@@ -564,14 +564,14 @@ python3 -c "import os; key=os.urandom(32); print(', '.join(f'0x{b:02x}' for b in
 
 ### IPC Socket Path
 
-Both license flows (STANDARD and HARDWARE_BOUND) use a **random UUID** for the
-socket path. The fingerprint (HARDWARE_BOUND) is used only for license verification,
-not for the socket name, making the path unpredictable.
+AF_UNIX sockets are used on **all platforms** — Linux, macOS, and Windows 10+
+(build 17063+, December 2017). Named pipes (go-winio) are no longer used.
+Both license flows use a random UUID for the socket path, making it unpredictable.
 
 | OS | Path |
 |---|---|
 | Linux/macOS | `/tmp/sentinel-<session_uuid>.sock` |
-| Windows | `\\.\pipe\sentinel-<session_uuid>` |
+| Windows | `%TEMP%\sentinel-<session_uuid>.sock` (via `os.TempDir()`) |
 
 ### Server
 
@@ -784,7 +784,7 @@ External Go dependencies:
 |---|---|---|
 | `github.com/spf13/cobra` | CLI framework — single root command with flags | Phase 1 |
 | `github.com/google/uuid` | UUID v4 generation for request nonces and IPC session IDs | Phase 5 |
-| `github.com/Microsoft/go-winio` | Windows named pipe IPC (`\\.\pipe\...`); build-tagged Windows-only | Phase 6 |
+| ~~`github.com/Microsoft/go-winio`~~ | Removed — AF_UNIX sockets used on Windows instead of named pipes | Phase 9 |
 | `mvdan.cc/garble` | Binary obfuscation (build tool only, not a library dependency) | Phase 8 |
 
 Everything else uses Go stdlib: `crypto/ecdsa`, `crypto/elliptic`, `crypto/sha256`,
@@ -870,14 +870,18 @@ Phase 8 ✓ Anti-tamper, degradation, and build system
           ├── internal/sentinel/sentinel.go             wired antitamper monitor (both license flows)
           └── Makefile                                  garble builds, cross-compilation (5 platforms)
 
-Phase 9 ✓ IPC authentication (AES-GCM) + Python SDK
+Phase 9 ✓ IPC authentication (AES-GCM) + Windows AF_UNIX + Python SDK
           ├── internal/ipc/ipc_key.go      (gitignored) shared AES-256-GCM key [32]byte
-          ├── internal/ipc/ipc.go          encryptMessage/decryptMessage; handleConnection
-          │                                updated to encrypt all responses and drop connections
-          │                                that fail decryption (unauthenticated clients)
-          ├── internal/ipc/ipc_test.go     TestServerServe updated for encrypted protocol
+          ├── internal/ipc/ipc.go          encryptMessage/decryptMessage; handleConnection drops
+          │                                unauthenticated connections; newListener/cleanupListener
+          │                                inlined (AF_UNIX on all platforms); SocketPath updated
+          │                                for Windows (%TEMP% dir)
+          ├── internal/ipc/ipc_unix.go     excluded (//go:build ignore)
+          ├── internal/ipc/ipc_windows.go  excluded (//go:build ignore); named pipes removed
+          ├── internal/ipc/ipc_test.go     dialSocket inlined; TestServerServe uses encrypted protocol
+          ├── internal/ipc/ipc_unix_test.go   excluded (//go:build ignore)
+          ├── internal/ipc/ipc_windows_test.go excluded (//go:build ignore)
           ├── internal/sentinel/sentinel.go runHardwareBound: socket path now uses random UUID
-          │                                (was fingerprint — predictable; now unpredictable)
           ├── .gitignore                   added internal/ipc/ipc_key.go pattern
           └── sentinel-drm-python-sdk/     companion Python SDK (separate repo)
               ├── src/sentinel_sdk/__init__.py  exports sentinel_protect_me_uwu
